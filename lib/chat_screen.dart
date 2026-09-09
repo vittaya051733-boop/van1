@@ -142,7 +142,10 @@ class _ChatScreenState extends State<ChatScreen> {
         }
 
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const _FriendListSkeleton();
+          if (_cachedFriends.isNotEmpty) {
+            return _buildFriendsListView(_cachedFriends);
+          }
+          return const _EmptyState(message: 'ยังไม่มีเพื่อนในระบบ');
         }
 
         return const _EmptyState(message: 'ยังไม่มีเพื่อนในระบบ');

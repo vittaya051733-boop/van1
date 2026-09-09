@@ -1,0 +1,30 @@
+{
+  "folders": [
+    {
+      "name": "van1 — Merchant",
+      "path": "/Users/tam/Documents/van1"
+    },
+    {
+      "name": "van2 — Customer",
+      "path": "/Users/tam/Documents/van2"
+    },
+    {
+      "name": "van3 — Rider",
+      "path": "/Users/tam/Documents/van3"
+    },
+    {
+      "name": "van4 — Admin",
+      "path": "/Users/tam/Documents/van4"
+    }
+  ],
+  "settings": {
+    "dart.flutterSdkPath": "/Users/tam/development/flutter",
+    "dart.flutterSdkPaths": [
+      "/Users/tam/development/flutter"
+    ],
+    "java.import.gradle.enabled": false,
+    "java.errors.incompleteClasspath.severity": "ignore",
+    "java.configuration.updateBuildConfiguration": "disabled",
+    "java.autobuild.enabled": false
+  }
+}

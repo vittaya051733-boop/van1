@@ -1,5 +1,20 @@
 const MERCHANT_WALLETS_COLLECTION = 'merchant_wallets';
 const MERCHANT_SECURITY_DEPOSIT_AMOUNT = 1000;
+const SETTLEMENT_DOC_PATH = 'platform_config/settlement';
+
+function readMerchantWithdrawMode(data) {
+  const raw = String(data?.merchantWithdrawMode || '').trim().toLowerCase();
+  return raw === 'omise' ? 'omise' : 'credits';
+}
+
+async function loadMerchantWithdrawMode() {
+  try {
+    const snap = await db.doc(SETTLEMENT_DOC_PATH).get();
+    return readMerchantWithdrawMode(snap.data());
+  } catch (_) {
+    return 'credits';
+  }
+}
 
 let db;
 let FieldValue;
@@ -63,11 +78,39 @@ function resolveSecurityDepositAmount(userData) {
   return 0;
 }
 
-function buildWalletFields(totalCredit, contractData, userData, walletData = {}) {
+function buildWalletFields(
+  totalCredit,
+  contractData,
+  userData,
+  walletData = {},
+  merchantWithdrawMode = 'credits',
+) {
   const isCancelled = isContractCancelled(contractData, userData);
   const omiseWithdrawable = readMoney(walletData.omiseWithdrawableCredit);
   const omiseLocked = readMoney(walletData.omiseLockedCredit);
+  const omisePending = readMoney(walletData.omisePendingCredit);
   const securityDepositAmount = resolveSecurityDepositAmount(userData);
+  const omiseFields = {
+    omiseWithdrawableCredit: omiseWithdrawable,
+    omiseLockedCredit: omiseLocked,
+    omisePendingCredit: omisePending,
+    merchantWithdrawMode,
+  };
+
+  if (merchantWithdrawMode === 'credits') {
+    const withdrawableCredit = Math.max(0, totalCredit);
+    return {
+      totalCredit,
+      withdrawableCredit,
+      lockedCredit: 0,
+      canWithdraw: withdrawableCredit > 0,
+      isContractCancelled: isCancelled,
+      contractStatus: isCancelled ? 'cancelled' : 'active',
+      securityDepositAmount,
+      securityDepositPaid: userData?.merchantSecurityDepositPaid === true,
+      ...omiseFields,
+    };
+  }
 
   if (isCancelled) {
     const withdrawableCredit = totalCredit + omiseWithdrawable;
@@ -80,9 +123,7 @@ function buildWalletFields(totalCredit, contractData, userData, walletData = {})
       contractStatus: 'cancelled',
       securityDepositAmount,
       securityDepositPaid: userData?.merchantSecurityDepositPaid === true,
-      omiseWithdrawableCredit: omiseWithdrawable,
-      omiseLockedCredit: omiseLocked,
-      omisePendingCredit: readMoney(walletData.omisePendingCredit),
+      ...omiseFields,
     };
   }
 
@@ -95,9 +136,7 @@ function buildWalletFields(totalCredit, contractData, userData, walletData = {})
     contractStatus: 'active',
     securityDepositAmount,
     securityDepositPaid: userData?.merchantSecurityDepositPaid === true,
-    omiseWithdrawableCredit: omiseWithdrawable,
-    omiseLockedCredit: omiseLocked,
-    omisePendingCredit: readMoney(walletData.omisePendingCredit),
+    ...omiseFields,
   };
 }
 
@@ -145,10 +184,11 @@ async function syncMerchantWallet(uid) {
     throw new Error('merchant uid is required');
   }
 
-  const [totalCredit, profile, walletDoc] = await Promise.all([
+  const [totalCredit, profile, walletDoc, merchantWithdrawMode] = await Promise.all([
     sumCredits(trimmedUid),
     loadContractAndUser(trimmedUid),
     db.collection(MERCHANT_WALLETS_COLLECTION).doc(trimmedUid).get(),
+    loadMerchantWithdrawMode(),
   ]);
 
   const walletFields = buildWalletFields(
@@ -156,6 +196,7 @@ async function syncMerchantWallet(uid) {
     profile.contractData,
     profile.userData,
     walletDoc.exists ? walletDoc.data() || {} : {},
+    merchantWithdrawMode,
   );
 
   const walletRef = db.collection(MERCHANT_WALLETS_COLLECTION).doc(trimmedUid);

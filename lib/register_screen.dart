@@ -9,10 +9,9 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'register_shop_next.dart';
 import 'contract_screen.dart';
 import 'services/branch_assignment_service.dart';
+import 'services/pending_registration_service.dart';
 import 'services/email_otp_service.dart';
-import 'services/notification_service.dart';
-import 'services/security_pin_service.dart';
-import 'services/app_unlock_session.dart';
+import 'utils/apple_sign_in_errors.dart';
 import 'utils/app_colors.dart';
 import 'utils/phone_login_helper.dart';
 import 'apple_auth.dart';
@@ -53,14 +52,12 @@ class _RegisterScreenState extends State<RegisterScreen> {
   static const String _iosClientId = String.fromEnvironment(
     'GOOGLE_IOS_CLIENT_ID',
     defaultValue:
-        '802503541368-l0arn6sf8bsfgeitv0lk7oddu3f3b9kt.apps.googleusercontent.com',
+        '802503541368-p2okrn2l0ic0rm26j7f7va6pgmdisutk.apps.googleusercontent.com',
   );
 
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmController = TextEditingController();
-  final TextEditingController _pinController = TextEditingController();
-  final TextEditingController _confirmPinController = TextEditingController();
   bool _loading = false;
   bool _isTypingPhoneNumber = false;
   bool _isSocialLoading = false;
@@ -249,33 +246,22 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    final pin = _pinController.text.trim();
-    final confirmPin = _confirmPinController.text.trim();
-    if (!SecurityPinService.instance.isValidPinFormat(pin)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('กรุณาตั้งรหัส PIN 6 หลัก')),
-      );
-      return;
-    }
-    if (pin != confirmPin) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('รหัส PIN ไม่ตรงกัน')),
-      );
-      return;
-    }
-
     setState(() => _loading = true);
     try {
-      debugPrint('🔄 เริ่มสร้างบัญชี: $contactInput'); // Debug log
+      debugPrint('🔄 เริ่มสร้างบัญชี: $contactInput');
+      await PendingRegistrationService.stage(
+        serviceType: _serviceTypeNormalized!,
+      );
+
       _pendingBranchAssignment ??=
           await BranchAssignmentService.resolveForCurrentLocation();
+      await PendingRegistrationService.stageBranch(_pendingBranchAssignment!);
 
       if (_isPhoneNumber(contactInput)) {
         // Navigate to phone verification screen
         final args = {
           'phone': _formatPhoneNumber(contactInput),
           'password': password,
-          'securityPin': pin,
           'serviceType': _serviceTypeNormalized,
           'branchAssignment': _pendingBranchAssignment?.toFirestoreFields(),
         };
@@ -284,74 +270,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
         return; // Stop execution here
       }
 
-      // Proceed with email registration
-      final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+      // Proceed with email registration — AuthWrapper จะนำทางต่อหลัง auth state เปลี่ยน
+      await FirebaseAuth.instance.createUserWithEmailAndPassword(
         email: contactInput,
         password: password,
       );
-      final user = cred.user;
-      debugPrint('✅ สร้างบัญชีสำเร็จ: ${user?.uid}'); // Debug log
-
-      if (user != null) {
-        await SecurityPinService.instance.setPin(user.uid, pin);
-        AppUnlockSession.unlock();
-
-        // *** แก้ไข: บันทึก serviceType ลงใน contracts collection ทันทีหลังสร้าง user ***
-        if (_serviceTypeNormalized != null) {
-          await FirebaseFirestore.instance
-              .collection('contracts')
-              .doc(user.uid)
-              .set({
-                'serviceType': _serviceTypeNormalized,
-                'status': 'pending_acceptance',
-                ...?_pendingBranchAssignment?.toFirestoreFields(),
-              });
-        }
-
-        try {
-          await NotificationService().saveUserFcmToken(user.uid);
-        } catch (e) {
-          debugPrint('Failed to sync FCM token on registration: $e');
-        }
-
-        if (user.emailVerified) {
-          await _saveServiceRegistration();
-          _navigateToContract();
-          return;
-        } else {
-          try {
-            await EmailOtpService.instance.sendOtp();
-            debugPrint('📧 ส่ง OTP ยืนยันอีเมลไปที่: ${user.email}');
-          } catch (emailError) {
-            debugPrint('❌ เกิดข้อผิดพลาดในการส่ง OTP อีเมล: $emailError');
-            debugPrint('Rollback: กำลังลบบัญชีที่สร้างไม่สำเร็จ...');
-
-            // Rollback: Delete the user if OTP sending fails.
-            await user.delete();
-            debugPrint('🗑️ ลบบัญชี ${user.uid} เรียบร้อยแล้ว');
-
-            // Throw an exception to be caught by the outer catch block.
-            throw Exception(
-              'การสร้างบัญชีล้มเหลวเนื่องจากไม่สามารถส่ง OTP ยืนยันอีเมลได้ กรุณาลองใหม่อีกครั้ง',
-            );
-          }
-        }
-      }
-
-      if (!mounted) return;
-
-      // Navigate to the email verification screen instead of popping.
-      // The user must verify their email before proceeding.
-      Navigator.pushNamedAndRemoveUntil(
-        context,
-        '/email-verification',
-        (route) => false,
-        arguments: {
-          'serviceType': _serviceTypeNormalized,
-          'nextRoute': 'contract',
-        },
-      );
+      debugPrint('✅ สร้างบัญชีสำเร็จ — รอ AuthWrapper นำทางต่อ');
     } on FirebaseAuthException catch (e) {
+      await PendingRegistrationService.clear();
       String message = 'เกิดข้อผิดพลาด';
       bool showResendOption = false;
 
@@ -395,6 +321,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
         );
       }
     } catch (e) {
+      await PendingRegistrationService.clear();
       // Catch other exceptions, like the one we threw for email failure.
       final message = e.toString().replaceFirst('Exception: ', '');
       debugPrint('❌ Exception: $message');
@@ -477,6 +404,28 @@ class _RegisterScreenState extends State<RegisterScreen> {
     }
   }
 
+  Future<bool> _stageRegistrationForSocialAuth() async {
+    if (_serviceTypeNormalized == null) {
+      _promptServiceTypeSelection();
+      return false;
+    }
+    await PendingRegistrationService.stage(
+      serviceType: _serviceTypeNormalized!,
+    );
+    unawaited(_resolveAndStageBranch());
+    return true;
+  }
+
+  Future<void> _resolveAndStageBranch() async {
+    try {
+      _pendingBranchAssignment ??=
+          await BranchAssignmentService.resolveForCurrentLocation();
+      await PendingRegistrationService.stageBranch(_pendingBranchAssignment!);
+    } catch (e) {
+      debugPrint('Branch staging for social auth failed: $e');
+    }
+  }
+
   Future<void> _handleSocialSignIn() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
@@ -497,7 +446,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
     // ส่ง OTP ยืนยันอีเมล (ถ้าเป็น Google ที่มีอีเมลและยังไม่ verified)
     if (user.email != null && !user.emailVerified) {
       try {
-        await EmailOtpService.instance.sendOtp();
+        await EmailOtpService.instance.sendOtp(email: user.email);
         debugPrint('📧 ส่ง OTP ยืนยันอีเมลไปที่: ${user.email}');
       } catch (e) {
         debugPrint('⚠️ ไม่สามารถส่ง OTP ยืนยันอีเมล: $e');
@@ -541,6 +490,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
       if (defaultTargetPlatform == TargetPlatform.iOS && _iosClientId.isEmpty) {
         throw StateError('ยังไม่ได้ตั้งค่า GOOGLE_IOS_CLIENT_ID');
       }
+
+      if (!await _stageRegistrationForSocialAuth()) return;
+
+      if (!mounted) return;
       debugPrint(
         'GoogleSignIn initialize (Android=${defaultTargetPlatform == TargetPlatform.android}) with serverClientId=$_androidServerClientId',
       );
@@ -567,10 +520,9 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
       final credential = GoogleAuthProvider.credential(idToken: idToken);
       await FirebaseAuth.instance.signInWithCredential(credential);
-
-      if (!mounted) return;
-      await _handleSocialSignIn();
+      debugPrint('✅ Google sign-in สำเร็จ — รอ AuthWrapper นำทางต่อ');
     } on GoogleSignInException catch (e) {
+      await PendingRegistrationService.clear();
       if (e.code != GoogleSignInExceptionCode.canceled) {
         _showSnack('Google เข้าสู่ระบบล้มเหลว (${e.code.name})');
         debugPrint('Google sign-in error: ${e.code} ${e.description ?? ''}');
@@ -582,6 +534,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
       _showSnack(e.message ?? 'Google เข้าสู่ระบบล้มเหลว');
       debugPrint('Firebase sign-in failed: ${e.code}');
     } catch (e) {
+      await PendingRegistrationService.clear();
       _showSnack('เกิดข้อผิดพลาดขณะเข้าสู่ระบบด้วย Google');
       debugPrint('Unexpected Google sign-in error: $e');
     } finally {
@@ -601,27 +554,24 @@ class _RegisterScreenState extends State<RegisterScreen> {
     });
 
     try {
+      if (!await _stageRegistrationForSocialAuth()) return;
+      if (!await confirmAppleSignInOnSimulator(context)) return;
+
       await signInWithApple();
-      if (!mounted) {
-        return;
-      }
-      await _handleSocialSignIn();
+      debugPrint('✅ Apple sign-in สำเร็จ — รอ AuthWrapper นำทางต่อ');
     } on FirebaseAuthException catch (e) {
       if (e.code == 'popup-closed-by-user' ||
           e.code == 'redirect-initiated' ||
           e.code == 'auth/redirect-initiated') {
         return;
       }
-      if (e.code == 'account-exists-with-different-credential' ||
-          e.code == 'auth/account-exists-with-different-credential') {
-        _showSnack('อีเมลนี้ใช้วิธีเข้าสู่ระบบอื่นอยู่แล้ว กรุณาเข้าสู่ระบบด้วยวิธีเดิม');
-        return;
-      }
+      await PendingRegistrationService.clear();
       debugPrint('Apple sign-in failed: ${e.code}');
-      _showSnack('ไม่สามารถสมัครด้วย Apple ได้ (${e.code})');
+      _showSnack(mapAppleSignInErrorMessage(e));
     } catch (e) {
+      await PendingRegistrationService.clear();
       debugPrint('Unexpected Apple sign-in error: $e');
-      _showSnack('ไม่สามารถสมัครด้วย Apple ได้');
+      _showSnack(mapAppleSignInErrorMessage(e));
     } finally {
       if (mounted) {
         setState(() {
@@ -694,8 +644,6 @@ class _RegisterScreenState extends State<RegisterScreen> {
     _emailController.dispose();
     _passwordController.dispose();
     _confirmController.dispose();
-    _pinController.dispose();
-    _confirmPinController.dispose();
     super.dispose();
   }
 
@@ -933,72 +881,6 @@ class _RegisterScreenState extends State<RegisterScreen> {
                           ),
                           labelStyle: TextStyle(color: Colors.black54),
                         ),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-
-                    Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.grey.shade300),
-                        color: Colors.grey.shade50,
-                      ),
-                      child: TextField(
-                        controller: _pinController,
-                        obscureText: true,
-                        keyboardType: TextInputType.number,
-                        maxLength: 6,
-                        decoration: const InputDecoration(
-                          labelText: 'รหัส PIN 6 หลัก',
-                          prefixIcon: Icon(
-                            Icons.pin_outlined,
-                            color: AppColors.accentDark,
-                            size: 20,
-                          ),
-                          border: InputBorder.none,
-                          counterText: '',
-                          contentPadding: EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 16,
-                          ),
-                          labelStyle: TextStyle(color: Colors.black54),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.grey.shade300),
-                        color: Colors.grey.shade50,
-                      ),
-                      child: TextField(
-                        controller: _confirmPinController,
-                        obscureText: true,
-                        keyboardType: TextInputType.number,
-                        maxLength: 6,
-                        decoration: const InputDecoration(
-                          labelText: 'ยืนยันรหัส PIN 6 หลัก',
-                          prefixIcon: Icon(
-                            Icons.pin_outlined,
-                            color: AppColors.accentDark,
-                            size: 20,
-                          ),
-                          border: InputBorder.none,
-                          counterText: '',
-                          contentPadding: EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 16,
-                          ),
-                          labelStyle: TextStyle(color: Colors.black54),
-                        ),
-                      ),
-                    ),
-                    const Padding(
-                      padding: EdgeInsets.only(top: 8),
-                      child: Text(
-                        'ใช้ปลดล็อกแอป และยืนยันก่อนถอนเงิน',
-                        style: TextStyle(fontSize: 12, color: Colors.black54),
                       ),
                     ),
                     const SizedBox(height: 16),

@@ -585,11 +585,15 @@ const SLIP_TRANS_REF_COLLECTION = 'slip_trans_refs';
 const TOPUP_SLIP_DAILY_ATTEMPTS_COLLECTION = 'topup_slip_daily_attempts';
 const TOP_UP_MAX_AMOUNT = 5000;
 const TOP_UP_MAX_DAILY_VERIFICATION_ATTEMPTS = 3;
-const MERCHANT_SECURITY_DEPOSIT_AMOUNT = 1000;
+const MERCHANT_PLATFORM_CONFIG_DOC = 'platform_config/merchant';
+const DEFAULT_MERCHANT_SECURITY_DEPOSIT_AMOUNT = 1000;
 const ALLOWED_TOPUP_STORAGE_BUCKETS = new Set([
   'van-merchant-van1-storage-802503541368',
   'van-merchant-van2-storage-802503541368',
   'van-merchant-van3-storage-802503541368',
+  // Legacy default bucket (iOS GoogleService-Info.plist เคยชี้ค่านี้)
+  'van-merchant.firebasestorage.app',
+  'van-merchant.appspot.com',
 ]);
 
 function parseNumber(value) {
@@ -624,6 +628,23 @@ function assertTopUpStoragePathForActor(uid, storagePath, sourceApp) {
   if (!path.startsWith(merchantPrefix)) {
     throw new HttpsError('permission-denied', 'เส้นทางสลิปไม่ถูกต้องสำหรับร้านค้า');
   }
+}
+
+function resolveTopUpTargetApp(sourceApp) {
+  const normalized = String(sourceApp || '').trim().toLowerCase();
+  if (normalized === 'van3_rider' || normalized.startsWith('van3')) {
+    return 'van3';
+  }
+  return 'van1';
+}
+
+function formatShortBaht(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) {
+    return '0';
+  }
+  const rounded = Math.round(n * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
 }
 
 function getBangkokDateKey(date = new Date()) {
@@ -702,6 +723,21 @@ async function getPaymentCollectionSettings() {
     });
     return defaults;
   }
+}
+
+async function getMerchantSecurityDepositRequiredBaht() {
+  try {
+    const snapshot = await db.doc(MERCHANT_PLATFORM_CONFIG_DOC).get();
+    const amount = parseNumber(snapshot.data()?.securityDepositRequiredBaht);
+    if (Number.isFinite(amount) && amount >= 0) {
+      return amount;
+    }
+  } catch (error) {
+    logger.warn('Failed to read merchant platform config. Falling back to default.', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return DEFAULT_MERCHANT_SECURITY_DEPOSIT_AMOUNT;
 }
 
 function normalizePaymentCollectionSettings(raw = {}) {
@@ -4088,7 +4124,7 @@ exports.sendEmailOtp = onCall(
       );
     }
 
-    return { success: true, expiresInSeconds: OTP_TTL_MS / 1000 };
+    return { success: true, email, expiresInSeconds: OTP_TTL_MS / 1000 };
   },
 );
 
@@ -5259,10 +5295,15 @@ exports.verifyTopUpSlip = onCall(
     if (!paymentGroupId) {
       throw new HttpsError('invalid-argument', 'กรุณาระบุ paymentGroupId');
     }
-    if (topUpPurpose === 'security_deposit' && expectedAmount < MERCHANT_SECURITY_DEPOSIT_AMOUNT) {
+    const merchantSecurityDepositRequiredBaht = await getMerchantSecurityDepositRequiredBaht();
+    if (
+      topUpPurpose === 'security_deposit'
+      && merchantSecurityDepositRequiredBaht > 0
+      && expectedAmount < merchantSecurityDepositRequiredBaht
+    ) {
       throw new HttpsError(
         'invalid-argument',
-        `ค่าประกันเปิดร้านขั้นต่ำ ${MERCHANT_SECURITY_DEPOSIT_AMOUNT.toLocaleString('th-TH')} บาท`,
+        `ค่าประกันเปิดร้านขั้นต่ำ ${merchantSecurityDepositRequiredBaht.toLocaleString('th-TH')} บาท`,
       );
     }
     if (storageBucket && !ALLOWED_TOPUP_STORAGE_BUCKETS.has(storageBucket)) {
@@ -5348,10 +5389,11 @@ exports.verifyTopUpSlip = onCall(
       const dataSucceeded = providerPayload?.data?.success === true;
       verifiedSlipAmount = parseNumber(providerPayload?.data?.amount);
       const hasValidAmount = Number.isFinite(verifiedSlipAmount) && verifiedSlipAmount > 0;
-      receiverValidation = validateSlipReceiver(providerPayload, slipValidationSettings, {
-        relaxNameFallback: false,
-        scanAllReceiverFields: true,
-      });
+      receiverValidation = validateTopUpSlipReceiver(
+        providerPayload,
+        slipValidationSettings,
+        slipValidationSettings.promptPayNationalIdOrTaxId,
+      );
       const hasMatchingReceiver = receiverValidation.matched;
       const hasMatchingAmount = amountsMatch(verifiedSlipAmount, expectedAmount);
       const transRef = String(providerPayload?.data?.transRef || '').trim();
@@ -5523,6 +5565,7 @@ exports.verifyTopUpSlip = onCall(
       };
     }
 
+    let creditedNow = false;
     try {
       await db.runTransaction(async (tx) => {
         const transRefRef = db.collection(SLIP_TRANS_REF_COLLECTION).doc(transRefForLock);
@@ -5535,6 +5578,7 @@ exports.verifyTopUpSlip = onCall(
 
         const existing = await tx.get(creditRef);
         if (!existing.exists) {
+          creditedNow = true;
           tx.set(creditRef, {
             uid,
             amount: creditedAmount,
@@ -5599,19 +5643,34 @@ exports.verifyTopUpSlip = onCall(
       throw lockError;
     }
 
-    try {
-      await merchantWallet.syncMerchantWallet(uid);
-    } catch (walletError) {
+    if (creditedNow && creditedAmount > 0) {
+      const targetApp = resolveTopUpTargetApp(sourceApp);
+      const isSecurityDeposit = topUpPurpose === 'security_deposit';
+      await db.collection('app_notifications').add({
+        targetApp,
+        recipientUid: uid,
+        title: isSecurityDeposit ? 'ชำระเงินประกันแล้ว' : 'เติมเครดิตสำเร็จ',
+        body: `+${formatShortBaht(creditedAmount)} บาท เข้ากระเป๋าแล้ว`,
+        action: isSecurityDeposit ? 'security_deposit_paid' : 'top_up_verified',
+        sourceApp: 'cloud_function',
+        read: false,
+        isRead: false,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    merchantWallet.syncMerchantWallet(uid).catch((walletError) => {
       logger.error('syncMerchantWallet after verifyTopUpSlip failed', {
         uid,
         message: walletError instanceof Error ? walletError.message : String(walletError),
       });
-    }
+    });
 
     let securityDepositPaid = false;
     if (
       topUpPurpose === 'security_deposit'
-      && creditedAmount >= MERCHANT_SECURITY_DEPOSIT_AMOUNT
+      && merchantSecurityDepositRequiredBaht > 0
+      && creditedAmount >= merchantSecurityDepositRequiredBaht
     ) {
       await db.collection('users').doc(uid).set(
         {
@@ -5641,4 +5700,4 @@ exports.verifyTopUpSlip = onCall(
 );
 
 // getMerchantWallet / sync triggers ย้ายไป van2/functions/merchant_wallet.js
-// คง syncMerchantWallet ใน verifyTopUpSlip เพื่ออัปเดตกระเป๋าทันทีหลังเติมเงิน
+// syncMerchantWallet ใน verifyTopUpSlip ทำงานแบบ async หลังตอบ success แล้ว

@@ -4,7 +4,12 @@ import 'data/merchant_security_deposit.dart';
 import 'utils/app_colors.dart';
 
 class MerchantSecurityDepositScreen extends StatelessWidget {
-  const MerchantSecurityDepositScreen({super.key});
+  const MerchantSecurityDepositScreen({
+    super.key,
+    required this.requiredAmountBaht,
+  });
+
+  final double requiredAmountBaht;
 
   @override
   Widget build(BuildContext context) {
@@ -33,7 +38,7 @@ class MerchantSecurityDepositScreen extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
                         Text(
-                          'ค่าประกัน ${MerchantSecurityDepositPolicy.requiredAmountBaht.toStringAsFixed(0)} บาท',
+                          'ค่าประกัน ${requiredAmountBaht.toStringAsFixed(0)} บาท',
                           style: const TextStyle(
                             fontSize: 22,
                             fontWeight: FontWeight.w800,

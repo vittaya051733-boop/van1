@@ -1,6 +1,8 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../data/merchant_security_deposit.dart';
+import 'merchant_platform_config_service.dart';
 
 class MerchantSecurityDepositService {
   MerchantSecurityDepositService._();
@@ -8,8 +10,11 @@ class MerchantSecurityDepositService {
   static final MerchantSecurityDepositService instance =
       MerchantSecurityDepositService._();
 
-  static const double requiredAmountBaht =
-      MerchantSecurityDepositPolicy.requiredAmountBaht;
+  Future<double> getRequiredAmountBaht([String? merchantUid]) {
+    return MerchantPlatformConfigService.instance.getSecurityDepositRequiredBaht(
+      merchantUid: merchantUid,
+    );
+  }
 
   Future<bool> isDepositPaid(String uid) async {
     final trimmedUid = uid.trim();
@@ -17,21 +22,44 @@ class MerchantSecurityDepositService {
       return false;
     }
 
-    final snapshot = await FirebaseFirestore.instance
-        .collection('users')
-        .doc(trimmedUid)
-        .get();
-    return snapshot.data()?['merchantSecurityDepositPaid'] == true;
+    final requiredAmount = await getRequiredAmountBaht(trimmedUid);
+    if (requiredAmount <= 0) {
+      return true;
+    }
+
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(trimmedUid)
+          .get()
+          .timeout(const Duration(seconds: 5));
+      final data = snapshot.data() ?? const <String, dynamic>{};
+      if (data['merchantSecurityDepositPaid'] == true) {
+        return true;
+      }
+      final paidAmount = _parseAmount(data['merchantSecurityDepositAmount']);
+      return paidAmount != null && paidAmount >= requiredAmount;
+    } on TimeoutException {
+      return false;
+    }
   }
 
   Future<bool> needsDepositGate(String uid) async {
-    if (await isDepositPaid(uid)) {
+    try {
+      final requiredAmount = await getRequiredAmountBaht(uid);
+      if (requiredAmount <= 0) {
+        return false;
+      }
+      if (await isDepositPaid(uid)) {
+        return false;
+      }
+      if (await _hasAnyProducts(uid)) {
+        return false;
+      }
+      return true;
+    } on TimeoutException {
       return false;
     }
-    if (await _hasAnyProducts(uid)) {
-      return false;
-    }
-    return true;
   }
 
   Future<bool> _hasAnyProducts(String uid) async {
@@ -39,7 +67,8 @@ class MerchantSecurityDepositService {
         .collection('products')
         .where('ownerUid', isEqualTo: uid)
         .limit(1)
-        .get();
+        .get()
+        .timeout(const Duration(seconds: 5));
     if (products.docs.isNotEmpty) {
       return true;
     }
@@ -48,7 +77,18 @@ class MerchantSecurityDepositService {
         .collection('product_admin_reviews')
         .where('ownerUid', isEqualTo: uid)
         .limit(1)
-        .get();
+        .get()
+        .timeout(const Duration(seconds: 5));
     return pendingReviews.docs.isNotEmpty;
+  }
+
+  double? _parseAmount(Object? value) {
+    if (value is num && value.isFinite) {
+      return value.toDouble();
+    }
+    if (value is String) {
+      return double.tryParse(value.trim());
+    }
+    return null;
   }
 }

@@ -22,7 +22,7 @@ class MerchantServiceAgreement {
     required String monthNumber,
     required String year,
   }) {
-    return '''
+    return sanitizeContractText('''
 สัญญาการให้บริการแพลตฟอร์ม แว๊นตลาด
 (สัญญาร้านค้า–แพลตฟอร์ม)
 
@@ -168,6 +168,62 @@ class MerchantServiceAgreement {
 
 
 [หมายเหตุ: การลงลายมือชื่อในระบบและการอัปโหลดเอกสารยืนยันตัวตน ถือเป็นการลงนามและยอมรับสัญญานี้]
-''';
+''');
+  }
+
+  /// ตัด/แปลงข้อความสัญญาเก่าให้ตรง template ปัจจุบัน
+  static String sanitizeContractText(String text) {
+    var sanitized = text
+        .replaceAll('บริษัทแว๊นตลาดจำกัด', 'ผู้ให้บริการแพลตฟอร์มแว๊นตลาด')
+        .replaceAll('บริษัท แว๊นตลาด จำกัด', 'ผู้ให้บริการแพลตฟอร์มแว๊นตลาด')
+        .replaceAll('บริษัท แว๊นตลาดจำกัด', 'ผู้ให้บริการแพลตฟอร์มแว๊นตลาด');
+
+    final lines = sanitized.split('\n');
+    final result = <String>[];
+    var index = 0;
+
+    while (index < lines.length) {
+      final trimmed = lines[index].trim();
+      final isLegacySignatureLine = trimmed.startsWith('ลงชื่อ') &&
+          (trimmed.contains('_') || trimmed.contains('—') || trimmed.contains('-'));
+
+      if (isLegacySignatureLine) {
+        final lookaheadEnd = (index + 6).clamp(0, lines.length);
+        final block = lines.sublist(index, lookaheadEnd).join('\n');
+        if (block.contains('ผู้มีอำนาจลงนามฝ่ายบริษัท') ||
+            block.contains('วิทยา ทนหงษา')) {
+          while (index < lines.length) {
+            final current = lines[index].trim();
+            index++;
+            if (current.startsWith('วันที่')) {
+              break;
+            }
+          }
+          continue;
+        }
+      }
+
+      result.add(lines[index]);
+      index++;
+    }
+
+    return result.join('\n').trimRight();
+  }
+
+  static String applyContractDate({
+    required String text,
+    required String day,
+    required String monthName,
+    required String year,
+  }) {
+    final headerPattern = RegExp(
+      r'สัญญาฉบับนี้ จัดทำขึ้น ณ วันที่ .+? พ\.ศ\. \d+',
+    );
+    final replacement =
+        'สัญญาฉบับนี้ จัดทำขึ้น ณ วันที่ $day เดือน $monthName พ.ศ. $year';
+    if (headerPattern.hasMatch(text)) {
+      return text.replaceFirst(headerPattern, replacement);
+    }
+    return text;
   }
 }

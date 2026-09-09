@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
 import 'phone_auth_config.dart';
+import 'platform_runtime.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 /// แปลงข้อผิดพลาด Firebase Phone Auth เป็นข้อความภาษาไทย
@@ -46,6 +47,13 @@ String _fallbackPhoneAuthMessage(FirebaseAuthException error) {
 }
 
 String _recaptchaTokenMissingMessage() {
+  if (isIosSimulator && shouldDisablePhoneAppVerification) {
+    return 'บน iOS Simulator ส่ง SMS จริงไม่ได้ — ใช้เบอร์ทดสอบเท่านั้น\n\n'
+        'Firebase Console → Authentication → Sign-in method → Phone → '
+        'Phone numbers for testing\n'
+        'เพิ่มเบอร์ +66812345678 และ OTP เช่น 123456\n'
+        'แล้วกรอกเบอร์นั้นในหน้าสมัคร (รูปแบบ +66...)';
+  }
   if (shouldDisablePhoneAppVerification) {
     return 'ยังส่ง OTP ไม่ได้ แม้เปิดโหมดทดสอบแล้ว\n'
         'ตรวจว่าเบอร์นี้อยู่ใน Firebase Console → Authentication → Phone → '
@@ -61,6 +69,10 @@ String _recaptchaTokenMissingMessage() {
 }
 
 String _missingAppCredentialMessage(FirebaseAuthException error) {
+  if (isIosSimulator && kDebugMode) {
+    return 'iOS Simulator ส่ง SMS OTP จริงไม่ได้ — ใช้เบอร์ทดสอบใน Firebase Console\n'
+        '(Authentication → Phone → Phone numbers for testing)';
+  }
   if (kDebugMode) {
     return 'ยืนยันแอปไม่ผ่าน (Play Integrity + reCAPTCHA)\n\n'
         'บน emulator/debug ต้องใช้เบอร์ทดสอบ:\n'

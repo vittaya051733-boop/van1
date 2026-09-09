@@ -92,14 +92,26 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
       return;
     }
 
-    setState(() => _currentProfile = _profileFromAuth(user));
+    setState(() {
+      _currentProfile = _profileFromAuth(user);
+      _chatReady = true;
+    });
     unawaited(_warmChatInBackground(user));
   }
 
   Future<void> _warmChatInBackground(User user) async {
     try {
-      final profile = await _friendService.getProfile(user.uid) ??
-          await _friendService.ensureCurrentUserProfile(user);
+      UserProfile? profile;
+      try {
+        profile = await _friendService
+            .getProfile(user.uid)
+            .timeout(const Duration(seconds: 8));
+      } on TimeoutException {
+        profile = _profileFromAuth(user);
+      }
+      profile ??= await _friendService
+          .ensureCurrentUserProfile(user)
+          .timeout(const Duration(seconds: 8));
       if (profile == null) {
         if (!mounted) return;
         setState(() => _error = 'ไม่พบข้อมูลผู้ใช้ปัจจุบัน');
@@ -123,10 +135,12 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
       final chatId = _chatService.chatIdFor(profile.uid, refreshedFriend.uid);
 
       // สร้างเอกสารห้องแชทให้เสร็จก่อน เพื่อเลี่ยง permission-denied ตอนฟัง messages
-      await _chatService.ensureChatAvailable(
-        sender: profile,
-        target: refreshedFriend,
-      );
+      await _chatService
+          .ensureChatAvailable(
+            sender: profile,
+            target: refreshedFriend,
+          )
+          .timeout(const Duration(seconds: 8));
 
       if (!mounted) return;
       setState(() {

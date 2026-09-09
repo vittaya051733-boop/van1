@@ -8,14 +8,31 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import 'order_qr_receipt_layout.dart';
 
-/// Narrow thermal / mini pocket printers (e.g. S1) usually accept bitmap only.
+/// Mini Pocket Printer S1: 57mm paper, 384-dot / 203dpi head.
+/// Render supersampled then downscale to 384 dots for crisp QR + Thai text.
+const int receiptRenderScale = 3;
 const double receiptPaperWidth = 384;
-const double receiptPadding = 14;
-const double receiptQrSize = 190;
-const double receiptBodyLineHeight = 25;
+const double receiptPadding = 16;
+const double receiptQrSize = 240;
+const double receiptQrQuietZone = 12;
+const double receiptBodyLineHeight = 18;
 const int receiptTrailingBlankLines = 3;
 
-Future<Uint8List> buildOrderQrReceiptPngBytes({
+double _s(double value) => value * receiptRenderScale;
+
+class OrderQrReceiptImage {
+  const OrderQrReceiptImage({
+    required this.pngBytes,
+    required this.qrTopRatio,
+    required this.qrHeightRatio,
+  });
+
+  final Uint8List pngBytes;
+  final double qrTopRatio;
+  final double qrHeightRatio;
+}
+
+Future<OrderQrReceiptImage> buildOrderQrReceiptPngBytes({
   required String qrPayload,
   required OrderQrReceiptLayout layout,
   String receiptTitle = 'แว๊นตลาด ORDER QR',
@@ -23,63 +40,62 @@ Future<Uint8List> buildOrderQrReceiptPngBytes({
   await GoogleFonts.pendingFonts([GoogleFonts.notoSansThai()]);
 
   final titleStyle = GoogleFonts.notoSansThai(
-    fontSize: 24,
+    fontSize: _s(20),
+    fontWeight: FontWeight.w800,
+    color: Colors.black,
+    height: 1.15,
+  );
+  final sectionStyle = GoogleFonts.notoSansThai(
+    fontSize: _s(17),
     fontWeight: FontWeight.w800,
     color: Colors.black,
     height: 1.2,
   );
-  final sectionStyle = GoogleFonts.notoSansThai(
-    fontSize: 21,
-    fontWeight: FontWeight.w700,
-    color: Colors.black,
-    height: 1.25,
-  );
   final bodyStyle = GoogleFonts.notoSansThai(
-    fontSize: 19,
+    fontSize: _s(16),
+    fontWeight: FontWeight.w900,
     color: Colors.black,
-    height: 1.3,
+    height: 1.2,
   );
   final toppingStyle = GoogleFonts.notoSansThai(
-    fontSize: 17,
-    color: const Color(0xFF334155),
-    height: 1.25,
+    fontSize: _s(14),
+    fontWeight: FontWeight.w900,
+    color: Colors.black,
+    height: 1.15,
   );
   final totalStyle = GoogleFonts.notoSansThai(
-    fontSize: 20,
+    fontSize: _s(17),
     fontWeight: FontWeight.w800,
     color: Colors.black,
-    height: 1.3,
+    height: 1.2,
   );
 
-  final contentWidth = receiptPaperWidth - (receiptPadding * 2);
+  final contentWidth = _s(receiptPaperWidth - (receiptPadding * 2));
+  final qrLabel = layout.orderCode.isNotEmpty
+      ? 'เลขที่ ${layout.orderCode}'
+      : 'Order ${layout.orderId}';
   final blocks = <_ReceiptBlock>[
     _ReceiptBlock.text(receiptTitle, titleStyle, center: true),
-    _ReceiptBlock.gap(8),
-    _ReceiptBlock.divider(),
-    _ReceiptBlock.gap(8),
-    _ReceiptBlock.text('QR CODE', sectionStyle, center: true),
-    _ReceiptBlock.gap(10),
+    _ReceiptBlock.gap(_s(4)),
+    _ReceiptBlock.text(qrLabel, sectionStyle, center: true),
+    _ReceiptBlock.gap(_s(6)),
     _ReceiptBlock.qr(qrPayload),
-    _ReceiptBlock.gap(12),
+    _ReceiptBlock.gap(_s(4)),
+    _ReceiptBlock.text(qrPayload, toppingStyle, center: true),
+    _ReceiptBlock.gap(_s(8)),
     _ReceiptBlock.divider(),
-    _ReceiptBlock.gap(8),
-    _ReceiptBlock.text('ข้อมูลที่ใช้ตรวจ QR', sectionStyle),
-    _ReceiptBlock.gap(6),
+    _ReceiptBlock.gap(_s(6)),
     _ReceiptBlock.text('Order ID: ${layout.orderId}', bodyStyle),
+    _ReceiptBlock.gap(_s(2)),
     _ReceiptBlock.text(
       'เลขออเดอร์: ${layout.orderCode.isEmpty ? '-' : layout.orderCode}',
       bodyStyle,
     ),
+    _ReceiptBlock.gap(_s(2)),
     _ReceiptBlock.text('วันที่: ${layout.dateTimeText}', bodyStyle),
-    _ReceiptBlock.gap(6),
+    _ReceiptBlock.gap(_s(4)),
     _ReceiptBlock.text('รายการสินค้า', sectionStyle),
-    _ReceiptBlock.gap(4),
-    _ReceiptBlock.leftRight(
-      'ค่าสินค้า',
-      formatOrderQrMoney(layout.productSubtotal),
-      bodyStyle,
-    ),
-    _ReceiptBlock.gap(4),
+    _ReceiptBlock.gap(_s(3)),
   ];
 
   for (final item in layout.items) {
@@ -97,44 +113,50 @@ Future<Uint8List> buildOrderQrReceiptPngBytes({
   }
 
   blocks.addAll(<_ReceiptBlock>[
-    _ReceiptBlock.gap(6),
+    _ReceiptBlock.gap(_s(4)),
     _ReceiptBlock.leftRight(
       'ค่าส่ง',
       formatOrderQrMoney(layout.shippingFee),
       bodyStyle,
     ),
-    _ReceiptBlock.gap(4),
+    _ReceiptBlock.gap(_s(2)),
     _ReceiptBlock.leftRight(
       'ยอดรวม',
       formatOrderQrMoney(layout.grandTotal),
       totalStyle,
       rightStyle: totalStyle,
     ),
-    _ReceiptBlock.gap(receiptBodyLineHeight * receiptTrailingBlankLines),
-    _ReceiptBlock.gap(8),
+    _ReceiptBlock.gap(_s(receiptBodyLineHeight * receiptTrailingBlankLines)),
   ]);
 
   final totalHeight = blocks.fold<double>(
-        receiptPadding * 2,
+        _s(receiptPadding * 2),
         (height, block) => height + block.height(contentWidth),
       ) +
-      8;
+      _s(4);
 
+  final renderWidth = (receiptPaperWidth * receiptRenderScale).round();
   final recorder = ui.PictureRecorder();
   final canvas = Canvas(recorder);
   canvas.drawRect(
-    Rect.fromLTWH(0, 0, receiptPaperWidth, totalHeight),
+    Rect.fromLTWH(0, 0, renderWidth.toDouble(), totalHeight),
     Paint()..color = const Color(0xFFFFFFFF),
   );
 
-  var y = receiptPadding;
+  var y = _s(receiptPadding);
+  var qrTop = 0.0;
+  var qrHeight = 0.0;
   for (final block in blocks) {
+    if (block.isQr) {
+      qrTop = y;
+      qrHeight = block.height(contentWidth);
+    }
     y += block.paint(canvas, y, contentWidth);
   }
 
   final picture = recorder.endRecording();
   final image = await picture.toImage(
-    receiptPaperWidth.toInt(),
+    renderWidth,
     totalHeight.ceil(),
   );
   final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
@@ -143,11 +165,20 @@ Future<Uint8List> buildOrderQrReceiptPngBytes({
   if (byteData == null) {
     throw StateError('ไม่สามารถสร้างภาพใบพิมพ์ได้');
   }
-  return byteData.buffer.asUint8List();
+  return OrderQrReceiptImage(
+    pngBytes: byteData.buffer.asUint8List(),
+    qrTopRatio: totalHeight > 0 ? qrTop / totalHeight : 0,
+    qrHeightRatio: totalHeight > 0 ? qrHeight / totalHeight : 0,
+  );
+}
+
+void _paintBoldText(Canvas canvas, TextPainter painter, Offset offset) {
+  painter.paint(canvas, offset);
+  painter.paint(canvas, offset + Offset(_s(0.8), 0));
 }
 
 class _ReceiptBlock {
-  _ReceiptBlock._(this._height, this._paint);
+  _ReceiptBlock._(this._height, this._paint, {this.isQr = false});
 
   factory _ReceiptBlock.text(
     String text,
@@ -165,9 +196,9 @@ class _ReceiptBlock {
         )..layout(maxWidth: contentWidth);
 
         final dx = center
-            ? receiptPadding + ((contentWidth - painter.width) / 2)
-            : receiptPadding;
-        painter.paint(canvas, Offset(dx, y));
+            ? _s(receiptPadding) + ((contentWidth - painter.width) / 2)
+            : _s(receiptPadding);
+        _paintBoldText(canvas, painter, Offset(dx, y));
         return painter.height;
       },
     );
@@ -198,10 +229,11 @@ class _ReceiptBlock {
           maxLines: null,
         )..layout(maxWidth: leftMaxWidth);
 
-        leftPainter.paint(canvas, Offset(receiptPadding, y));
-        rightPainter.paint(
+        _paintBoldText(canvas, leftPainter, Offset(_s(receiptPadding), y));
+        _paintBoldText(
           canvas,
-          Offset(receiptPadding + contentWidth - rightPainter.width, y),
+          rightPainter,
+          Offset(_s(receiptPadding) + contentWidth - rightPainter.width, y),
         );
         return math.max(leftPainter.height, rightPainter.height).toDouble();
       },
@@ -209,18 +241,20 @@ class _ReceiptBlock {
   }
 
   factory _ReceiptBlock.divider() {
+    final line = receiptRenderScale.toDouble();
     return _ReceiptBlock._(
-      1,
+      line,
       (canvas, y, contentWidth) {
         final paint = Paint()
           ..color = Colors.black
-          ..strokeWidth = 1;
+          ..isAntiAlias = false
+          ..strokeWidth = line;
         canvas.drawLine(
-          Offset(receiptPadding, y),
-          Offset(receiptPadding + contentWidth, y),
+          Offset(_s(receiptPadding), y),
+          Offset(_s(receiptPadding) + contentWidth, y),
           paint,
         );
-        return 1;
+        return line;
       },
     );
   }
@@ -230,12 +264,24 @@ class _ReceiptBlock {
   }
 
   factory _ReceiptBlock.qr(String payload) {
+    final qrCode = QrCode.fromData(
+      data: payload,
+      errorCorrectLevel: QrErrorCorrectLevel.L,
+    );
+    final qrSideFinal =
+        _qrPixelPerfectSize(qrCode.moduleCount, receiptQrSize);
+    final qrSide = qrSideFinal * receiptRenderScale;
+    final box = qrSide + (receiptQrQuietZone * 2 * receiptRenderScale);
     return _ReceiptBlock._(
-      receiptQrSize,
+      box,
       (canvas, y, _) {
-        final painter = QrPainter(
-          data: payload,
-          version: QrVersions.auto,
+        final left = (_s(receiptPaperWidth) - box) / 2;
+        canvas.drawRect(
+          Rect.fromLTWH(left, y, box, box),
+          Paint()..color = Colors.white,
+        );
+        final painter = QrPainter.withQr(
+          qr: qrCode,
           gapless: true,
           eyeStyle: const QrEyeStyle(
             eyeShape: QrEyeShape.square,
@@ -246,17 +292,19 @@ class _ReceiptBlock {
             color: Colors.black,
           ),
         );
-        final left = (receiptPaperWidth - receiptQrSize) / 2;
         canvas.save();
-        canvas.translate(left, y);
-        painter.paint(canvas, Size(receiptQrSize, receiptQrSize));
+        final quiet = receiptQrQuietZone * receiptRenderScale;
+        canvas.translate(left + quiet, y + quiet);
+        painter.paint(canvas, Size(qrSide, qrSide));
         canvas.restore();
-        return receiptQrSize;
+        return box;
       },
+      isQr: true,
     );
   }
 
   final double _height;
+  final bool isQr;
   final double Function(Canvas canvas, double y, double contentWidth) _paint;
 
   double height(double contentWidth) {
@@ -274,4 +322,12 @@ class _ReceiptBlock {
     final measureCanvas = Canvas(ui.PictureRecorder());
     return _paint(measureCanvas, 0, contentWidth);
   }
+}
+
+double _qrPixelPerfectSize(int moduleCount, double targetSize) {
+  if (moduleCount <= 0) {
+    return targetSize;
+  }
+  final modulePixels = (targetSize / moduleCount).floor().clamp(1, 64);
+  return modulePixels * moduleCount.toDouble();
 }

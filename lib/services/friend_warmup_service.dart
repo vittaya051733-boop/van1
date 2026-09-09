@@ -71,8 +71,22 @@ class FriendWarmupService {
       },
       onError: (Object error) {
         debugPrint('FriendWarmupService stream failed: $error');
+        final controller = _friendsController;
+        if (controller != null && !controller.isClosed) {
+          controller.add(_latestFriends);
+        }
       },
     );
+
+    Future<void>.delayed(const Duration(seconds: 8), () {
+      final controller = _friendsController;
+      if (controller == null || controller.isClosed) {
+        return;
+      }
+      if (_latestFriends.isEmpty) {
+        controller.add(const <FriendPreview>[]);
+      }
+    });
 
     final user = FirebaseAuth.instance.currentUser;
     if (user != null) {

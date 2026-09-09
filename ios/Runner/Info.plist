@@ -3,10 +3,15 @@
 <plist version="1.0">
 	<dict>
 		<key>CFBundleDevelopmentRegion</key>
-		<string>$(DEVELOPMENT_LANGUAGE)</string>
+		<string>th</string>
+		<key>CFBundleLocalizations</key>
+		<array>
+			<string>th</string>
+		</array>
+		<key>CFBundleAllowMixedLocalizations</key>
+		<true/>
 		<key>CFBundleDisplayName</key>
-		<string>แว๊นตลาด
-ร้านค้า</string>
+		<string>แว๊นตลาดร้านค้า</string>
 		<key>CFBundleExecutable</key>
 		<string>$(EXECUTABLE_NAME)</string>
 		<key>CFBundleIdentifier</key>
@@ -14,7 +19,7 @@
 		<key>CFBundleInfoDictionaryVersion</key>
 		<string>6.0</string>
 		<key>CFBundleName</key>
-		<string>แว๊นตลาด ร้านค้า</string>
+		<string>แว๊นตลาดร้านค้า</string>
 		<key>CFBundlePackageType</key>
 		<string>APPL</string>
 		<key>CFBundleShortVersionString</key>

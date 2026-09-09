@@ -23,6 +23,21 @@ import '../firebase_options.dart';
 import '../main.dart';
 import '../widgets/chat_message_popup.dart';
 import '../chat_room_screen.dart';
+import '../wallet_screen.dart';
+
+const Set<String> _walletNotificationActions = {
+  'payout_pending',
+  'payout_paid',
+  'credit_released',
+  'top_up_verified',
+  'credit_adjusted',
+  'security_deposit_paid',
+};
+
+bool _isWalletNotificationAction(String? action) {
+  final normalized = (action ?? '').trim();
+  return _walletNotificationActions.contains(normalized);
+}
 
 String _normalizeInboxKeyPart(String? value) {
   final normalized = (value ?? '').trim().toLowerCase();
@@ -820,6 +835,10 @@ class NotificationService {
           return;
         }
         if (decoded['type'] == 'app_notification') {
+          if (_isWalletNotificationAction(decoded['action'] as String?)) {
+            _openWallet();
+            return;
+          }
           _openOrderManagement(decoded['orderId'] as String?);
           return;
         }
@@ -857,11 +876,15 @@ class NotificationService {
       return;
     }
 
-    final orderId = message.data['orderId'] as String?;
-    if (orderId != null &&
-        orderId.isNotEmpty &&
-        message.data['type'] == 'app_notification') {
-      _openOrderManagement(orderId);
+    if (message.data['type'] == 'app_notification') {
+      if (_isWalletNotificationAction(message.data['action'] as String?)) {
+        _openWallet();
+        return;
+      }
+      final orderId = message.data['orderId'] as String?;
+      if (orderId != null && orderId.isNotEmpty) {
+        _openOrderManagement(orderId);
+      }
     }
 
     // เปิดหน้ารับสายอัตโนมัติเมื่อแตะ notification ประเภท call
@@ -1296,6 +1319,21 @@ class NotificationService {
           'sourceApp': 'van1',
           'action': action,
         });
+  }
+
+  void openWalletFromNotification() {
+    _openWallet();
+  }
+
+  void _openWallet() {
+    final navigator = MyApp.navigatorKey.currentState;
+    if (navigator == null) {
+      return;
+    }
+
+    navigator.push(
+      MaterialPageRoute<void>(builder: (_) => const WalletScreen()),
+    );
   }
 
   void _openOrderManagement([String? orderId]) {

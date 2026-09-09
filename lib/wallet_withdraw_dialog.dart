@@ -16,7 +16,7 @@ class WalletWithdrawDialog extends StatefulWidget {
 }
 
 class _WalletWithdrawDialogState extends State<WalletWithdrawDialog> {
-  static const double _defaultMinWithdrawAmount = 30;
+  static const double _defaultMinWithdrawAmount = 1;
   static const double _defaultWithdrawFeeBaht = 10;
 
   final TextEditingController _customAmountController = TextEditingController();
@@ -236,7 +236,19 @@ class _WalletWithdrawDialogState extends State<WalletWithdrawDialog> {
                 child: Center(child: CircularProgressIndicator()),
               )
             : _loadError != null
-                ? Text(_loadError!)
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(_loadError!),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: _loadBalance,
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('โหลดใหม่'),
+                      ),
+                    ],
+                  )
                 : SingleChildScrollView(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,

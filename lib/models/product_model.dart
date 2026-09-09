@@ -118,6 +118,11 @@ class Product {
     return Product._fromMap(doc.id, doc.data() ?? <String, dynamic>{});
   }
 
+  /// Creates a product from the app's local cache without using Firestore.
+  factory Product.fromMap(String id, Map<String, dynamic> map) {
+    return Product._fromMap(id, map);
+  }
+
   /// สินค้าที่รอแอดมินอนุมัติ (ยังไม่อยู่ใน collection products)
   factory Product.fromAdminReviewSnapshot(
     DocumentSnapshot<Map<String, dynamic>> doc,

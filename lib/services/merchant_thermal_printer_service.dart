@@ -7,6 +7,7 @@ import 'package:thermal_printer_flutter/thermal_printer_flutter.dart';
 
 import 'merchant_bluetooth_printer_service.dart';
 import 'merchant_escpos_encoder.dart';
+import 'merchant_receipt_raster.dart';
 
 class MerchantThermalPrinterService {
   MerchantThermalPrinterService._();
@@ -22,6 +23,7 @@ class MerchantThermalPrinterService {
   static const MethodChannel _thermalChannel = MethodChannel(
     'thermal_printer_flutter',
   );
+  Printer? _activeBlePrinter;
 
   Future<void> printViaWifi(BuildContext context, Uint8List receiptPng) async {
     final printer = await _resolveNetworkPrinter(context);
@@ -30,12 +32,29 @@ class MerchantThermalPrinterService {
     _showSuccess(context, 'พิมพ์ผ่าน Wi-Fi แล้ว');
   }
 
-  Future<void> printViaBle(BuildContext context, Uint8List receiptPng) async {
+  Future<void> printViaBle(
+    BuildContext context,
+    Uint8List receiptPng,
+  ) async {
     await _ensureBleReady();
     final printer = await _resolveBlePrinter(context);
     await _printBleEscPos(receiptPng, printer);
     await _rememberPrinter(printer);
     _showSuccess(context, 'พิมพ์ผ่าน Bluetooth แล้ว');
+  }
+
+  /// True when we can print without a 5s BLE scan (saved or live session).
+  Future<bool> hasBlePrinterReady() async {
+    if (_activeBlePrinter != null &&
+        _activeBlePrinter!.bleAddress.trim().isNotEmpty) {
+      if (await _plugin.isConnected(printer: _activeBlePrinter!)) {
+        return true;
+      }
+    }
+    final saved = await _loadSavedPrinter();
+    return saved != null &&
+        saved.type == PrinterType.bluetooth &&
+        saved.bleAddress.trim().isNotEmpty;
   }
 
   Future<void> printViaUsb(BuildContext context, Uint8List receiptPng) async {
@@ -62,39 +81,97 @@ class MerchantThermalPrinterService {
     }
   }
 
-  Future<void> _printBleEscPos(Uint8List receiptPng, Printer printer) async {
-    final bytes = Uint8List.fromList(await buildEscPosReceiptBytes(receiptPng));
-    final connected = await _plugin.connect(printer: printer);
-    if (!connected) {
-      throw const PrinterUserException('เชื่อมต่อเครื่องพิมพ์ไม่สำเร็จ');
+  Future<void> _printBleEscPos(
+    Uint8List receiptPng,
+    Printer printer,
+  ) async {
+    late final Uint8List escPosBytes;
+    try {
+      if (Platform.isIOS) {
+        // S1PRO uses Lujiang/LuckPrinter commands and a native 384-dot raster.
+        escPosBytes = buildS1ProReceiptBytes(receiptPng);
+      } else {
+        escPosBytes = Uint8List.fromList(
+          await buildEscPosReceiptBytes(receiptPng, pocketPrinter: true),
+        );
+      }
+    } catch (error, stack) {
+      debugPrint('Printer BLE encode error: $error\n$stack');
+      if (Platform.isIOS) {
+        throw PrinterUserException(
+          'สร้างข้อมูลพิมพ์ไม่สำเร็จ — ลองพิมพ์อีกครั้ง',
+        );
+      }
+      try {
+        escPosBytes = Uint8List.fromList(
+          await buildEscPosReceiptBytes(receiptPng, pocketPrinter: true),
+        );
+      } catch (retryError, retryStack) {
+        debugPrint('Printer BLE encode retry error: $retryError\n$retryStack');
+        throw PrinterUserException(
+          'สร้างข้อมูลพิมพ์ไม่สำเร็จ — ลองพิมพ์อีกครั้ง',
+        );
+      }
     }
+    final bytes = escPosBytes;
+    debugPrint(
+      'Printer BLE ${printer.name} ${printer.bleAddress} bytes=${bytes.length}',
+    );
+    await _ensureBleConnected(printer);
 
     try {
-      // On iOS, connect completes before CoreBluetooth finishes discovering
-      // the printer's writable characteristic. Retry the native write until
-      // that characteristic is ready, and check its boolean result.
-      for (var attempt = 0; attempt < 6; attempt++) {
+      for (var attempt = 0; attempt < 8; attempt++) {
         if (attempt > 0) {
-          await Future<void>.delayed(const Duration(milliseconds: 500));
+          await Future<void>.delayed(const Duration(milliseconds: 400));
         }
+        debugPrint('Printer BLE write attempt ${attempt + 1}');
         final printed = await _thermalChannel.invokeMethod<bool>(
           'writebytes',
           bytes,
         );
+        debugPrint('Printer BLE write result=$printed');
         if (printed == true) {
+          await Future<void>.delayed(const Duration(milliseconds: 800));
           return;
         }
       }
+      _activeBlePrinter = null;
       throw const PrinterUserException(
         'เชื่อมต่อแล้วแต่เครื่องพิมพ์ยังไม่พร้อมรับข้อมูล กรุณาลองใหม่',
       );
     } on PlatformException catch (error) {
+      debugPrint('Printer BLE write error: ${error.code} ${error.message}');
+      _activeBlePrinter = null;
       throw PrinterUserException(
         'ส่งงานพิมพ์ผ่าน Bluetooth ไม่สำเร็จ: ${error.message ?? error.code}',
       );
-    } finally {
-      await _plugin.disconnect(printer: printer);
     }
+  }
+
+  Future<void> _ensureBleConnected(Printer printer) async {
+    final samePrinter =
+        _activeBlePrinter?.bleAddress == printer.bleAddress &&
+        printer.bleAddress.trim().isNotEmpty;
+    if (samePrinter) {
+      final stillConnected = await _plugin.isConnected(printer: printer);
+      if (stillConnected) {
+        debugPrint('Printer BLE already connected ${printer.bleAddress}');
+        return;
+      }
+    }
+
+    debugPrint('Printer BLE connect ${printer.name} ${printer.bleAddress}');
+    final connected = await _plugin.connect(printer: printer);
+    debugPrint('Printer BLE connect result=$connected');
+    if (!connected) {
+      _activeBlePrinter = null;
+      throw const PrinterUserException(
+        'เชื่อมต่อเครื่องพิมพ์ไม่สำเร็จ — รอช่องส่งข้อมูลไม่ทันหรือเครื่องหลุด',
+      );
+    }
+    _activeBlePrinter = printer;
+    // Mini Pocket S1 starts the motor as soon as GATT is up; wait before raster.
+    await Future<void>.delayed(const Duration(milliseconds: 600));
   }
 
   Future<void> _ensureBleReady() async {
@@ -178,7 +255,20 @@ class MerchantThermalPrinterService {
   }
 
   Future<Printer> _resolveBlePrinter(BuildContext context) async {
+    if (_activeBlePrinter != null &&
+        _activeBlePrinter!.bleAddress.trim().isNotEmpty) {
+      if (await _plugin.isConnected(printer: _activeBlePrinter!)) {
+        return _activeBlePrinter!;
+      }
+    }
+
     final saved = await _loadSavedPrinter();
+    if (saved != null &&
+        saved.type == PrinterType.bluetooth &&
+        saved.bleAddress.trim().isNotEmpty) {
+      return saved;
+    }
+
     final devices = await _plugin.getPrinters(
       printerType: PrinterType.bluetooth,
     );
@@ -187,17 +277,6 @@ class MerchantThermalPrinterService {
         'ไม่พบเครื่องพิมพ์ Bluetooth — เปิดเครื่องพิมพ์แล้วลองใหม่ (iOS รองรับ BLE)',
       );
     }
-
-    devices.sort((a, b) {
-      final aSaved =
-          saved?.type == PrinterType.bluetooth &&
-          saved?.bleAddress == a.bleAddress;
-      final bSaved =
-          saved?.type == PrinterType.bluetooth &&
-          saved?.bleAddress == b.bleAddress;
-      if (aSaved == bSaved) return 0;
-      return aSaved ? -1 : 1;
-    });
 
     if (!context.mounted) {
       throw const PrinterUserException('ไม่สามารถเลือกเครื่องพิมพ์ได้');
@@ -219,16 +298,10 @@ class MerchantThermalPrinterService {
                 final label = device.name.trim().isNotEmpty
                     ? device.name
                     : device.bleAddress;
-                final isSaved =
-                    saved?.type == PrinterType.bluetooth &&
-                    saved?.bleAddress == device.bleAddress;
                 return ListTile(
                   title: Text(label),
                   subtitle: device.bleAddress.trim().isNotEmpty
                       ? Text(device.bleAddress)
-                      : null,
-                  trailing: isSaved
-                      ? const Chip(label: Text('ล่าสุด'))
                       : null,
                   onTap: () => Navigator.of(dialogContext).pop(device),
                 );

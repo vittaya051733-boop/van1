@@ -1,5 +1,9 @@
 abstract final class MerchantSecurityDepositPolicy {
-  static const double requiredAmountBaht = 1000;
+  /// Fallback when `platform_config/merchant` is missing (admin can override).
+  static const double defaultRequiredAmountBaht = 1000;
+
+  @Deprecated('Use MerchantSecurityDepositService.getRequiredAmountBaht()')
+  static const double requiredAmountBaht = defaultRequiredAmountBaht;
 
   static const String title = 'ค่าประกันเปิดร้าน';
 

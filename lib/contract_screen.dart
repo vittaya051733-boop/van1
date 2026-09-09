@@ -94,7 +94,7 @@ class _ContractScreenState extends State<ContractScreen> {
   Future<void> _ensureContractState() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
-      _fetchContractText();
+      await _fetchContractText();
       return;
     }
     try {
@@ -123,28 +123,19 @@ class _ContractScreenState extends State<ContractScreen> {
     } catch (e) {
       debugPrint('Failed to check existing contract status: $e');
     }
-    _fetchContractText();
+    if (!mounted) return;
+    await _fetchContractText();
   }
 
   Future<void> _fetchContractText() async {
+    if (!mounted) return;
     setState(() {
       _isLoading = true;
       _error = null;
     });
 
-  var template = _buildDefaultContractTemplate();
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        final doc = await FirebaseFirestore.instance.collection('contracts').doc(user.uid).get();
-        final stored = doc.data()?['contractText'] as String?;
-        if (stored != null && stored.trim().isNotEmpty) {
-          template = stored;
-        }
-      }
-    } catch (e) {
-      setState(() => _error = 'ไม่สามารถโหลดสัญญา: $e');
-    }
+    _setCurrentDate();
+    final template = _buildDefaultContractTemplate();
 
     if (!mounted) return;
     setState(() {
@@ -177,6 +168,7 @@ class _ContractScreenState extends State<ContractScreen> {
     setState(() => _isUploading = true);
 
     try {
+      _setCurrentDate();
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) throw Exception('กรุณาเข้าสู่ระบบก่อน');
       await user.reload();
@@ -213,7 +205,16 @@ class _ContractScreenState extends State<ContractScreen> {
       if (mounted) {
         _showSnackBar('กำลังบันทึกไฟล์สัญญา (.txt)...', Colors.blue);
       }
-      final contractText = '${_contractTextController.text}\n\nลายมือชื่อ (ฝั่งร้านค้า): [ลงลายมือชื่อในระบบ]\nวันที่ $_currentDay/$_currentMonthNumber/$_currentYear';
+      final contractBody = MerchantServiceAgreement.applyContractDate(
+        text: MerchantServiceAgreement.sanitizeContractText(
+          _contractTextController.text,
+        ),
+        day: _currentDay,
+        monthName: _currentMonthName,
+        year: _currentYear,
+      );
+      final contractText =
+          '$contractBody\n\nลายมือชื่อ (ฝั่งร้านค้า): [ลงลายมือชื่อในระบบ]\nวันที่ $_currentDay/$_currentMonthNumber/$_currentYear';
       final contractBytes = utf8.encode(contractText);
       final timestamp = DateTime.now().millisecondsSinceEpoch;
         final contractFileName =
@@ -239,7 +240,7 @@ class _ContractScreenState extends State<ContractScreen> {
         'status': 'accepted',
         'contractTextUrl': contractDownloadUrl,
         'signatureImageUrl': signatureUrl,
-        'contractText': _contractTextController.text,
+        'contractText': contractBody,
         'acceptedAt': FieldValue.serverTimestamp(),
         if (_verifiedNationalId != null) ...<String, dynamic>{
           'verifiedNationalId': _verifiedNationalId,
@@ -263,7 +264,9 @@ class _ContractScreenState extends State<ContractScreen> {
           _showSnackBar('📄 สัญญาถูกบันทึกในโฟลเดอร์ Downloads แล้ว', Colors.blue);
         }
       } catch (e) {
-        _showErrorDialog('ไม่สามารถบันทึกไฟล์ลงเครื่องได้: $e');
+        if (mounted) {
+          _showErrorDialog('ไม่สามารถบันทึกไฟล์ลงเครื่องได้: $e');
+        }
       }
 
       // บันทึกลายเซ็นลงเครื่องผู้ใช้ (PNG)
@@ -275,7 +278,9 @@ class _ContractScreenState extends State<ContractScreen> {
               fileExtension: 'png',
               mimeType: MimeType.png);
         } catch (e) {
-          _showErrorDialog('ไม่สามารถบันทึกลายเซ็นลงเครื่องได้: $e');
+          if (mounted) {
+            _showErrorDialog('ไม่สามารถบันทึกลายเซ็นลงเครื่องได้: $e');
+          }
         }
       }
 
@@ -293,7 +298,9 @@ class _ContractScreenState extends State<ContractScreen> {
             mimeType: _fileSaverMimeForExtension(frontResult.extension),
           );
         } catch (e) {
-          _showErrorDialog('ไม่สามารถบันทึกรูปบัตรประชาชน (หน้า) ลงเครื่องได้: $e');
+          if (mounted) {
+            _showErrorDialog('ไม่สามารถบันทึกรูปบัตรประชาชน (หน้า) ลงเครื่องได้: $e');
+          }
         }
       }
       if (_selectedIdCardBackImage != null) {
@@ -309,7 +316,9 @@ class _ContractScreenState extends State<ContractScreen> {
             mimeType: _fileSaverMimeForExtension(backResult.extension),
           );
         } catch (e) {
-          _showErrorDialog('ไม่สามารถบันทึกรูปบัตรประชาชน (หลัง) ลงเครื่องได้: $e');
+          if (mounted) {
+            _showErrorDialog('ไม่สามารถบันทึกรูปบัตรประชาชน (หลัง) ลงเครื่องได้: $e');
+          }
         }
       }
 
@@ -339,7 +348,9 @@ class _ContractScreenState extends State<ContractScreen> {
         ),
       );
     } catch (e) {
-      _showErrorDialog('เกิดข้อผิดพลาดทั่วไป: $e');
+      if (mounted) {
+        _showErrorDialog('เกิดข้อผิดพลาดทั่วไป: $e');
+      }
     } finally {
       if (mounted) {
         setState(() => _isUploading = false);
@@ -585,6 +596,7 @@ class _ContractScreenState extends State<ContractScreen> {
 
     final originalFile = File(imagePath);
 
+    if (!mounted) return;
     setState(() {
       if (isFront) {
         _selectedIdCardFrontImage = null;
@@ -682,6 +694,7 @@ class _ContractScreenState extends State<ContractScreen> {
   }
 
   void _showErrorDialog(String error) {
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -745,6 +758,13 @@ service firebase.storage {
   }
 
   @override
+  void dispose() {
+    _signatureController.dispose();
+    _contractTextController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.white,
@@ -800,6 +820,7 @@ service firebase.storage {
               else
                 TextField(
                   controller: _contractTextController,
+                  readOnly: true,
                   maxLines: null,
                   minLines: 10,
                   style: const TextStyle(

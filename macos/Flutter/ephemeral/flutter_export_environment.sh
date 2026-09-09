@@ -1,11 +1,12 @@
 #!/bin/sh
 # This is a generated file; do not edit or check into version control.
-export "FLUTTER_ROOT=C:\flutter"
-export "FLUTTER_APPLICATION_PATH=C:\Users\TAM\Desktop\van1\my-flutter"
+export "FLUTTER_ROOT=/Users/tam/development/flutter"
+export "FLUTTER_APPLICATION_PATH=/Users/tam/Documents/van1"
+export "FLUTTER_FRAMEWORK_SWIFT_PACKAGE_PATH=/Users/tam/Documents/van1/macos/Flutter/ephemeral/Packages/.packages/FlutterFramework"
 export "COCOAPODS_PARALLEL_CODE_SIGN=true"
 export "FLUTTER_BUILD_DIR=build"
 export "FLUTTER_BUILD_NAME=1.0.15"
-export "FLUTTER_BUILD_NUMBER=11"
+export "FLUTTER_BUILD_NUMBER=23"
 export "DART_OBFUSCATION=false"
 export "TRACK_WIDGET_CREATION=true"
 export "TREE_SHAKE_ICONS=false"

@@ -40,6 +40,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
   bool _isLoading = false;
   bool _isFirstLoad = true;
   bool _hasMore = true;
+  bool _isOpeningAddProduct = false;
+  int _fetchGeneration = 0;
+  String? _loadError;
   DocumentSnapshot? _lastDocument;
 
   bool get _areAllProductsSelected {
@@ -62,7 +65,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
   @override
   void initState() {
     super.initState();
-    _fetchProducts();
+    _fetchProducts(replace: true);
     _scrollController.addListener(_onScroll);
     if (widget.initialHomeProductIds != null) {
       _homeProductIds.addAll(widget.initialHomeProductIds!);
@@ -95,21 +98,18 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         return;
       }
 
-      QuerySnapshot<Map<String, dynamic>> snapshot;
+      QuerySnapshot<Map<String, dynamic>>? snapshot;
       try {
         snapshot = await FirebaseFirestore.instance
             .collection('product_admin_reviews')
             .where('ownerUid', isEqualTo: user.uid)
             .where('adminReviewStatus', isEqualTo: 'pending')
             .orderBy('submittedAt', descending: true)
-            .get();
-      } catch (_) {
-        snapshot = await FirebaseFirestore.instance
-            .collection('product_admin_reviews')
-            .where('ownerUid', isEqualTo: user.uid)
-            .where('adminReviewStatus', isEqualTo: 'pending')
-            .get();
-      }
+            .get(const GetOptions(source: Source.cache))
+            .timeout(const Duration(seconds: 2));
+      } catch (_) {}
+
+      snapshot ??= await _fetchPendingReviewsFromServer(user.uid);
 
       final docs = snapshot.docs.toList();
       docs.sort((a, b) {
@@ -127,84 +127,174 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       for (final doc in docs) {
         _productRawById[doc.id] = Map<String, dynamic>.from(doc.data());
       }
+    } on TimeoutException {
+      debugPrint('ShopManagementScreen pending reviews timed out');
     } catch (e, stack) {
       debugPrint('ShopManagementScreen pending reviews error: $e');
       debugPrint('Stack: $stack');
     }
   }
 
-  Future<void> _fetchProducts() async {
-    if (_isLoading || (!_hasMore && !_isFirstLoad)) return;
+  Future<QuerySnapshot<Map<String, dynamic>>> _fetchPendingReviewsFromServer(
+    String userId,
+  ) async {
+    try {
+      return await FirebaseFirestore.instance
+          .collection('product_admin_reviews')
+          .where('ownerUid', isEqualTo: userId)
+          .where('adminReviewStatus', isEqualTo: 'pending')
+          .orderBy('submittedAt', descending: true)
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 6));
+    } on FirebaseException catch (e) {
+      if (e.code != 'failed-precondition') {
+        rethrow;
+      }
+      return FirebaseFirestore.instance
+          .collection('product_admin_reviews')
+          .where('ownerUid', isEqualTo: userId)
+          .where('adminReviewStatus', isEqualTo: 'pending')
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 6));
+    }
+  }
 
+  Future<void> _fetchProducts({bool replace = false}) async {
+    if (_isLoading && !replace) return;
+    if (!replace && !_hasMore && !_isFirstLoad) return;
+
+    final generation = replace ? ++_fetchGeneration : _fetchGeneration;
     if (mounted) {
       setState(() {
         _isLoading = true;
+        if (replace) {
+          _loadError = null;
+        }
       });
     }
 
     try {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null) {
+        _loadError = 'ไม่พบข้อมูลผู้ใช้ กรุณาเข้าสู่ระบบใหม่';
         return;
       }
 
-      final pendingFuture = _isFirstLoad ? _fetchPendingReviews() : null;
-
-      QuerySnapshot<Map<String, dynamic>> querySnapshot;
-      try {
-        Query<Map<String, dynamic>> query = FirebaseFirestore.instance
-            .collection('products')
-            .where('ownerUid', isEqualTo: user.uid)
-            .orderBy('createdAt', descending: true);
-
-        if (_lastDocument != null) {
-          query = query.startAfterDocument(
-            _lastDocument! as DocumentSnapshot<Map<String, dynamic>>,
-          );
+      if (_products.isEmpty) {
+        await _loadProductsFromLocalCache(user.uid);
+        if (generation != _fetchGeneration) return;
+        if (mounted && _products.isNotEmpty) {
+          setState(() {
+            _isFirstLoad = false;
+            _loadError = null;
+          });
         }
-
-        querySnapshot = await query.limit(_pageSize).get();
-      } catch (_) {
-        Query<Map<String, dynamic>> query = FirebaseFirestore.instance
-            .collection('products')
-            .where('ownerUid', isEqualTo: user.uid);
-
-        querySnapshot = await query.limit(_pageSize).get();
       }
+
+      try {
+        final cachedSnapshot = await _fetchProductPage(
+          user.uid,
+          cacheOnly: true,
+        ).timeout(const Duration(seconds: 2));
+        if (generation != _fetchGeneration) return;
+        if (cachedSnapshot.docs.isNotEmpty) {
+          _applyProductDocs(
+            cachedSnapshot,
+            replace: _products.isEmpty || replace,
+          );
+          if (mounted) {
+            setState(() {
+              _isFirstLoad = false;
+              _loadError = null;
+            });
+          }
+        }
+      } catch (e) {
+        debugPrint('ShopManagementScreen cache read skipped: $e');
+      }
+
+      final pendingFuture =
+          (_isFirstLoad || replace) ? _fetchPendingReviews() : null;
+
+      QuerySnapshot<Map<String, dynamic>>? querySnapshot;
+      Object? fetchError;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (generation != _fetchGeneration) return;
+        try {
+          querySnapshot = await _fetchProductPage(user.uid).timeout(
+            const Duration(seconds: 12),
+          );
+          fetchError = null;
+          break;
+        } on TimeoutException catch (e) {
+          fetchError = e;
+        } on FirebaseException catch (e) {
+          if (e.code != 'unavailable' && e.code != 'network-request-failed') {
+            rethrow;
+          }
+          fetchError = e;
+        }
+        if (attempt == 0) {
+          await Future<void>.delayed(const Duration(seconds: 2));
+        }
+      }
+
+      if (generation != _fetchGeneration) return;
 
       if (pendingFuture != null) {
         unawaited(
           pendingFuture.then((_) {
-            if (mounted) {
+            if (mounted && generation == _fetchGeneration) {
               setState(() {});
             }
           }),
         );
       }
 
-      if (querySnapshot.docs.length < _pageSize) {
-        _hasMore = false;
+      if (querySnapshot != null) {
+        _applyProductDocs(
+          querySnapshot,
+          replace: replace || _products.isEmpty,
+        );
+        _loadError = null;
+        unawaited(_persistLocalProductCache(user.uid));
+        return;
       }
 
-      if (querySnapshot.docs.isNotEmpty) {
-        _lastDocument = querySnapshot.docs.last;
-        for (final doc in querySnapshot.docs) {
-          _productRawById[doc.id] = Map<String, dynamic>.from(doc.data());
+      final loadedFromCache = await _loadProductsFromLocalCache(user.uid);
+      if (generation != _fetchGeneration) return;
+      if (loadedFromCache || _products.isNotEmpty) {
+        _hasMore = false;
+        _loadError = null;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('เครือข่ายไม่ตอบสนอง กำลังแสดงข้อมูลที่บันทึกไว้'),
+            ),
+          );
         }
-        final newProducts =
-            querySnapshot.docs.map(Product.fromSnapshot).toList();
-        _products.addAll(newProducts);
+        return;
       }
+
+      throw fetchError ?? TimeoutException('ไม่สามารถเชื่อมต่อฐานข้อมูลได้');
     } catch (e, stack) {
       debugPrint('ShopManagementScreen Firestore error: $e');
       debugPrint('Stack: $stack');
-      if (mounted) {
+      if (!mounted || generation != _fetchGeneration) return;
+      _hasMore = false;
+      if (_products.isEmpty) {
+        _loadError =
+            'เชื่อมต่อข้อมูลสินค้าไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่';
+      } else {
+        _loadError = null;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('เกิดข้อผิดพลาดในการโหลดข้อมูล: $e')),
+          const SnackBar(
+            content: Text('รีเฟรชไม่สำเร็จ แสดงสินค้าชุดล่าสุดที่โหลดไว้'),
+          ),
         );
       }
     } finally {
-      if (mounted) {
+      if (mounted && generation == _fetchGeneration) {
         setState(() {
           _isLoading = false;
           _isFirstLoad = false;
@@ -213,32 +303,152 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     }
   }
 
+  void _applyProductDocs(
+    QuerySnapshot<Map<String, dynamic>> snapshot, {
+    required bool replace,
+  }) {
+    if (replace) {
+      _products.clear();
+      _productRawById.clear();
+      _lastDocument = null;
+    }
+
+    _hasMore = snapshot.docs.length >= _pageSize;
+
+    if (snapshot.docs.isEmpty) {
+      return;
+    }
+
+    _lastDocument = snapshot.docs.last;
+    for (final doc in snapshot.docs) {
+      _productRawById[doc.id] = Map<String, dynamic>.from(doc.data());
+    }
+    final newProducts = snapshot.docs.map(Product.fromSnapshot).toList();
+    if (replace) {
+      _products
+        ..clear()
+        ..addAll(newProducts);
+    } else {
+      final existingIds =
+          _products.map((p) => p.id).whereType<String>().toSet();
+      _products.addAll(
+        newProducts.where(
+          (product) => product.id == null || existingIds.add(product.id!),
+        ),
+      );
+    }
+  }
+
+  Future<void> _persistLocalProductCache(String ownerUid) async {
+    final cachedProducts = _products
+        .where((product) => product.id != null)
+        .map((product) {
+          final id = product.id!;
+          return CachedProduct(
+            id: id,
+            data: Map<String, dynamic>.from(
+              _productRawById[id] ?? product.toMap(),
+            ),
+          );
+        })
+        .toList(growable: false);
+    await ProductCacheService.instance.saveProducts(ownerUid, cachedProducts);
+  }
+
+  Future<bool> _loadProductsFromLocalCache(String ownerUid) async {
+    final cached = await ProductCacheService.instance.loadProducts(ownerUid);
+    if (cached.isEmpty) {
+      return false;
+    }
+
+    final existingIds = _products
+        .map((product) => product.id)
+        .whereType<String>()
+        .toSet();
+    for (final item in cached) {
+      if (!existingIds.add(item.id)) {
+        continue;
+      }
+      _productRawById[item.id] = Map<String, dynamic>.from(item.data);
+      _products.add(Product.fromMap(item.id, item.data));
+    }
+    return _products.isNotEmpty;
+  }
+
+  Future<QuerySnapshot<Map<String, dynamic>>> _fetchProductPage(
+    String ownerUid, {
+    bool cacheOnly = false,
+  }) async {
+    final options = cacheOnly
+        ? const GetOptions(source: Source.cache)
+        : const GetOptions();
+    Query<Map<String, dynamic>> query = FirebaseFirestore.instance
+        .collection('products')
+        .where('ownerUid', isEqualTo: ownerUid)
+        .orderBy('createdAt', descending: true);
+
+    if (_lastDocument != null && !cacheOnly) {
+      query = query.startAfterDocument(
+        _lastDocument! as DocumentSnapshot<Map<String, dynamic>>,
+      );
+    }
+
+    try {
+      return await query.limit(_pageSize).get(options);
+    } on FirebaseException catch (e) {
+      if (e.code != 'failed-precondition') {
+        rethrow;
+      }
+      return FirebaseFirestore.instance
+          .collection('products')
+          .where('ownerUid', isEqualTo: ownerUid)
+          .limit(_pageSize)
+          .get(options);
+    }
+  }
+
   Future<void> _refresh() async {
-    _products.clear();
-    _pendingReviewProducts.clear();
-    _productRawById.clear();
     _lastDocument = null;
-    _isFirstLoad = true;
     _hasMore = true;
     _isLoading = false;
-    await _fetchProducts();
+    _loadError = null;
+    await _fetchProducts(replace: true);
   }
 
   Future<bool> _ensureCanAddFirstProduct() async {
+    if (_products.isNotEmpty || _pendingReviewProducts.isNotEmpty) {
+      return true;
+    }
+
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       return false;
     }
 
-    final depositService = MerchantSecurityDepositService.instance;
-    if (!await depositService.needsDepositGate(user.uid)) {
+    try {
+      final needsGate = await MerchantSecurityDepositService.instance
+          .needsDepositGate(user.uid)
+          .timeout(const Duration(seconds: 5));
+      if (!needsGate) {
+        return true;
+      }
+    } on TimeoutException {
+      debugPrint('Deposit gate check timed out; allowing add product');
+      return true;
+    }
+
+    final requiredAmount = await MerchantSecurityDepositService.instance
+        .getRequiredAmountBaht(user.uid);
+    if (requiredAmount <= 0) {
       return true;
     }
 
     final agreed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
         fullscreenDialog: true,
-        builder: (_) => const MerchantSecurityDepositScreen(),
+        builder: (_) => MerchantSecurityDepositScreen(
+          requiredAmountBaht: requiredAmount,
+        ),
       ),
     );
     if (agreed != true || !mounted) {
@@ -248,9 +458,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     final topUpOk = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => const WalletTopUpDialog(
-        initialAmount: MerchantSecurityDepositService.requiredAmountBaht,
-        minimumAmount: MerchantSecurityDepositService.requiredAmountBaht,
+      builder: (_) => WalletTopUpDialog(
+        initialAmount: requiredAmount,
+        minimumAmount: requiredAmount,
         isSecurityDeposit: true,
       ),
     );
@@ -258,7 +468,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       return false;
     }
 
-    final paid = await depositService.isDepositPaid(user.uid);
+    final paid = await MerchantSecurityDepositService.instance.isDepositPaid(
+      user.uid,
+    );
     if (!paid && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -270,19 +482,33 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
   }
 
   void _navigateToAddProduct(BuildContext context, {Product? product}) async {
-    if (product == null) {
-      final allowed = await _ensureCanAddFirstProduct();
-      if (!allowed || !context.mounted) {
-        return;
-      }
+    if (_isOpeningAddProduct) {
+      return;
     }
+    if (mounted) {
+      setState(() => _isOpeningAddProduct = true);
+    }
+    try {
+      if (product == null) {
+        final allowed = await _ensureCanAddFirstProduct();
+        if (!allowed || !context.mounted) {
+          return;
+        }
+      }
 
-    final bool? result = await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (context) => AddProductScreen(productToEdit: product)),
-    );
-    if (result == true) {
-      _refresh();
+      final bool? result = await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => AddProductScreen(productToEdit: product),
+        ),
+      );
+      if (result == true) {
+        _refresh();
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isOpeningAddProduct = false);
+      }
     }
   }
 
@@ -566,22 +792,24 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     required Color iconColor,
     required String tooltip,
     required VoidCallback? onPressed,
+    double size = 36,
+    double iconSize = 20,
   }) {
     return Material(
       color: backgroundColor,
-      borderRadius: BorderRadius.circular(12),
-      elevation: 3,
+      borderRadius: BorderRadius.circular(10),
+      elevation: 2,
       shadowColor: Colors.black45,
       child: InkWell(
         onTap: onPressed,
         enableFeedback: false,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         child: SizedBox(
-          width: 44,
-          height: 44,
+          width: size,
+          height: size,
           child: Tooltip(
             message: tooltip,
-            child: Icon(icon, color: iconColor, size: 26),
+            child: Icon(icon, color: iconColor, size: iconSize),
           ),
         ),
       ),
@@ -634,10 +862,21 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         ),
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => _navigateToAddProduct(context),
+        onPressed: _isOpeningAddProduct
+            ? null
+            : () => _navigateToAddProduct(context),
         tooltip: 'เพิ่มสินค้า',
         backgroundColor: AppColors.accent,
-        child: const Icon(Icons.add, color: Colors.white),
+        child: _isOpeningAddProduct
+            ? const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              )
+            : const Icon(Icons.add, color: Colors.white),
       ),
     );
   }
@@ -697,6 +936,39 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         ],
       );
     }
+
+    if (_displayProducts.isEmpty && _loadError != null) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          SizedBox(
+            height: 320,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.cloud_off_rounded, size: 64, color: Colors.grey[500]),
+                const SizedBox(height: 16),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 28),
+                  child: Text(
+                    _loadError!,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 15, color: Colors.grey[700]),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: _isLoading ? null : _refresh,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('ลองใหม่'),
+                ),
+              ],
+            ),
+          ),
+        ],
+      );
+    }
+
     if (_displayProducts.isEmpty) {
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
@@ -726,17 +998,16 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
 
     return GridView.builder(
       controller: _scrollController,
-      padding: const EdgeInsets.all(8.0),
+      padding: const EdgeInsets.all(16),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-        childAspectRatio: 0.78,
+        crossAxisSpacing: 16,
+        mainAxisSpacing: 16,
       ),
-      itemCount: _displayProducts.length + (_hasMore ? 1 : 0),
+      itemCount: _displayProducts.length + (_isLoading ? 1 : 0),
       itemBuilder: (context, index) {
         if (index >= _displayProducts.length) {
-          return _hasMore
+          return _isLoading
               ? const Center(child: Padding(
                   padding: EdgeInsets.all(8.0),
                   child: CircularProgressIndicator(),
@@ -759,12 +1030,12 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         return Container(
             decoration: BoxDecoration(
               color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(16),
               boxShadow: const [
                 BoxShadow(
                   color: Colors.black12,
                   blurRadius: 6,
-                  offset: Offset(0, 2),
+                  offset: Offset(0, 3),
                 ),
               ],
               border: Border.all(
@@ -775,7 +1046,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
               ),
             ),
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(16),
               child: Stack(
                 fit: StackFit.expand,
                 children: [
@@ -818,11 +1089,11 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                     right: 0,
                     bottom: 0,
                     child: Container(
-                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+                    padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
                     decoration: const BoxDecoration(
                       borderRadius: BorderRadius.only(
-                        bottomLeft: Radius.circular(12),
-                        bottomRight: Radius.circular(12),
+                        bottomLeft: Radius.circular(16),
+                        bottomRight: Radius.circular(16),
                       ),
                       gradient: LinearGradient(
                         begin: Alignment.bottomCenter,
@@ -926,8 +1197,8 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                       ? const SizedBox.shrink()
                       : isBusy
                       ? const SizedBox(
-                          width: 148,
-                          height: 44,
+                          width: 108,
+                          height: 36,
                           child: Center(
                             child: SizedBox(
                               width: 24,
@@ -951,7 +1222,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                                     : 'ตั้งส่วนลด',
                                 onPressed: () => _editProductDiscount(product),
                               ),
-                              const SizedBox(width: 6),
+                              const SizedBox(width: 4),
                               _buildProductActionButton(
                                 icon: Icons.edit_rounded,
                                 backgroundColor: const Color(0xFF1565C0),
@@ -960,7 +1231,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                                 onPressed: () =>
                                     _navigateToAddProduct(context, product: product),
                               ),
-                              const SizedBox(width: 6),
+                              const SizedBox(width: 4),
                               _buildProductActionButton(
                                 icon: Icons.delete_rounded,
                                 backgroundColor: const Color(0xFFD32F2F),

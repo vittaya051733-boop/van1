@@ -52,9 +52,9 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
         'profile_pictures/${_user!.uid}/${DateTime.now().millisecondsSinceEpoch}',
       );
       if (kIsWeb) {
-        return uploadProfileImage(ref: ref, image: image);
+        return await uploadProfileImage(ref: ref, image: image);
       }
-      return uploadXFilePathToStorage(ref, image.path);
+      return await uploadXFilePathToStorage(ref, image.path);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('อัปโหลดรูปภาพล้มเหลว: $e')));

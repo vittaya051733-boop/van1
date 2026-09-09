@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'home_screen.dart';
 import 'login_screen.dart';
 import 'welcome_screen.dart';
@@ -82,7 +83,7 @@ void main() {
                   ? AndroidDebugProvider(debugToken: kVan1AppCheckDebugToken)
                   : const AndroidPlayIntegrityProvider(),
               providerApple: useDebugAppCheck
-                  ? const AppleDebugProvider()
+                  ? AppleDebugProvider(debugToken: kVan1AppCheckDebugToken)
                   : const AppleDeviceCheckProvider(),
             )
             .timeout(const Duration(seconds: 5)); // กันค้าง
@@ -186,9 +187,12 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'แว๊นตลาด ร้านค้า',
+      title: 'แว๊นตลาดร้านค้า',
       debugShowCheckedModeBanner: false,
       navigatorKey: navigatorKey,
+      locale: const Locale('th', 'TH'),
+      supportedLocales: const <Locale>[Locale('th', 'TH')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
@@ -306,7 +310,7 @@ class AuthWrapper extends StatefulWidget {
 }
 
 class _AuthWrapperState extends State<AuthWrapper> {
-  static const Duration _navigationTimeout = Duration(seconds: 20);
+  static const Duration _navigationTimeout = Duration(seconds: 8);
   bool _showRetry = false;
 
   @override
@@ -381,10 +385,7 @@ class _AuthWrapperState extends State<AuthWrapper> {
             ] else ...[
               const Text('ไม่สามารถตรวจสอบข้อมูลได้'),
               const SizedBox(height: 16),
-              FilledButton(
-                onPressed: _navigate,
-                child: const Text('ลองใหม่'),
-              ),
+              FilledButton(onPressed: _navigate, child: const Text('ลองใหม่')),
               TextButton(
                 onPressed: () {
                   if (!context.mounted) return;

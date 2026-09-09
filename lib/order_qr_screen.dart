@@ -1,14 +1,9 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import 'models/order_model.dart';
 import 'services/order_qr_printer_service.dart';
 import 'services/order_qr_receipt_layout.dart';
-import 'services/shop_order_voice_commands.dart';
 import 'utils/app_colors.dart';
 
 export 'services/order_qr_printer_service.dart'
@@ -19,213 +14,19 @@ String orderQrOrderCode(DetailedOrder order) {
   return code != null && code.isNotEmpty ? code : '';
 }
 
-class OrderQRScreen extends StatefulWidget {
+class OrderQRScreen extends StatelessWidget {
   const OrderQRScreen({
     super.key,
     required this.order,
-    this.autoStartVoiceListening = false,
+    this.voiceCommandBar,
   });
 
   final DetailedOrder order;
-  final bool autoStartVoiceListening;
-
-  @override
-  State<OrderQRScreen> createState() => _OrderQRScreenState();
-}
-
-class _OrderQRScreenState extends State<OrderQRScreen> {
-  final stt.SpeechToText _speech = stt.SpeechToText();
-  bool _voiceReady = false;
-  bool _voiceAvailable = false;
-  bool _voiceSessionEnabled = false;
-  bool _isListening = false;
-  bool _hasAutoStartedVoice = false;
-  bool _isHandlingVoiceCommand = false;
-  String _voiceMessage = 'กดไมค์แล้วพูด ย้อนกลับ เพื่อกลับหน้าจัดการออเดอร์';
-  String _lastVoiceText = '';
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_initVoiceCommands());
-    if (widget.autoStartVoiceListening) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        unawaited(_maybeAutoStartVoiceListening());
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _voiceSessionEnabled = false;
-    unawaited(_speech.stop());
-    unawaited(_speech.cancel());
-    super.dispose();
-  }
-
-  Future<void> _initVoiceCommands() async {
-    try {
-      final available = await _speech.initialize(
-        onStatus: (status) {
-          if (!mounted) return;
-          if (status == 'done' || status == 'notListening') {
-            setState(() => _isListening = false);
-            if (_voiceSessionEnabled && !_isHandlingVoiceCommand) {
-              unawaited(_startVoiceListening());
-            }
-          }
-        },
-        onError: (_) {
-          if (!mounted) return;
-          setState(() {
-            _isListening = false;
-            _voiceMessage = 'ไมค์ยังฟังไม่ได้ ลองกดไมค์อีกครั้ง';
-          });
-        },
-      );
-      if (!mounted) return;
-      setState(() {
-        _voiceAvailable = available;
-        _voiceReady = true;
-        _voiceMessage = available
-            ? _voiceMessage
-            : 'ไม่พบระบบรับเสียงของเครื่อง';
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _voiceReady = true;
-        _voiceAvailable = false;
-        _voiceMessage = 'เปิดระบบเสียงไม่สำเร็จ';
-      });
-    }
-  }
-
-  Future<void> _maybeAutoStartVoiceListening() async {
-    if (_hasAutoStartedVoice || !_voiceReady || !_voiceAvailable) return;
-    final granted = await _ensureMicrophonePermission();
-    if (!granted || !mounted) return;
-    _hasAutoStartedVoice = true;
-    await _toggleVoiceSession();
-  }
-
-  Future<bool> _ensureMicrophonePermission() async {
-    final status = await Permission.microphone.status;
-    if (status.isGranted) return true;
-    final requested = await Permission.microphone.request();
-    if (requested.isGranted) return true;
-    if (!mounted) return false;
-    setState(() {
-      _voiceMessage = requested.isPermanentlyDenied
-          ? 'กรุณาเปิดสิทธิ์ไมค์ในตั้งค่าเครื่อง'
-          : 'ต้องอนุญาตไมค์ก่อนใช้คำสั่งเสียง';
-    });
-    return false;
-  }
-
-  Future<void> _toggleVoiceSession() async {
-    if (_voiceSessionEnabled || _isListening) {
-      _voiceSessionEnabled = false;
-      await _speech.stop();
-      await _speech.cancel();
-      if (!mounted) return;
-      setState(() {
-        _isListening = false;
-        _voiceMessage = 'ปิดการฟังคำสั่งเสียงแล้ว';
-      });
-      return;
-    }
-
-    if (!_voiceReady) {
-      await _initVoiceCommands();
-    }
-    if (!_voiceAvailable) {
-      if (!mounted) return;
-      setState(() => _voiceMessage = 'ไม่พบระบบรับเสียงของเครื่อง');
-      return;
-    }
-
-    final granted = await _ensureMicrophonePermission();
-    if (!granted) return;
-
-    _voiceSessionEnabled = true;
-    await _startVoiceListening();
-  }
-
-  Future<void> _startVoiceListening() async {
-    if (!mounted || !_voiceSessionEnabled || _isHandlingVoiceCommand) return;
-    if (_isListening) return;
-
-    final started = await _speech.listen(
-      onResult: (result) {
-        _handleVoiceResult(
-          result.recognizedWords,
-          isFinal: result.finalResult,
-        );
-      },
-      localeId: 'th_TH',
-      listenMode: stt.ListenMode.confirmation,
-      partialResults: true,
-      cancelOnError: true,
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _isListening = started;
-      _voiceMessage = started
-          ? 'พูด ย้อนกลับ เพื่อกลับหน้าจัดการออเดอร์'
-          : 'เปิดไมค์ไม่สำเร็จ ลองอีกครั้ง';
-    });
-  }
-
-  void _handleVoiceResult(String words, {required bool isFinal}) {
-    if (!mounted || _isHandlingVoiceCommand) return;
-    final heardText = words.trim();
-    if (heardText.isEmpty) return;
-
-    final isBack = ShopOrderVoiceCommands.matchBackNavigation(heardText);
-    if (!isFinal) {
-      setState(() {
-        _lastVoiceText = heardText;
-        _voiceMessage = isBack
-            ? 'ได้ยิน: ย้อนกลับ'
-            : 'กำลังฟัง... (พูด ย้อนกลับ)';
-      });
-      if (isBack) {
-        unawaited(_popWithVoiceFeedback(heardText));
-      }
-      return;
-    }
-
-    if (!isBack) {
-      setState(() {
-        _lastVoiceText = heardText;
-        _voiceMessage = 'ได้ยิน: $heardText — ลองพูด ย้อนกลับ';
-      });
-      return;
-    }
-
-    unawaited(_popWithVoiceFeedback(heardText));
-  }
-
-  Future<void> _popWithVoiceFeedback(String heardText) async {
-    if (!mounted || _isHandlingVoiceCommand) return;
-    _isHandlingVoiceCommand = true;
-    _voiceSessionEnabled = false;
-    await _speech.stop();
-    await _speech.cancel();
-    if (!mounted) return;
-    setState(() {
-      _lastVoiceText = heardText;
-      _isListening = false;
-      _voiceMessage = 'กำลังย้อนกลับ...';
-    });
-    Navigator.of(context).pop();
-  }
+  final Widget? voiceCommandBar;
 
   String _qrPayload(String type) {
-    if (type == 'VAN_ORDER') return orderQrCodeText(widget.order);
-    return '$type:${widget.order.orderId}|${orderQrOrderCode(widget.order)}|${widget.order.totalAmount.toStringAsFixed(2)}';
+    if (type == 'VAN_ORDER') return orderQrCodeText(order);
+    return '$type:${order.orderId}|${orderQrOrderCode(order)}|${order.totalAmount.toStringAsFixed(2)}';
   }
 
   @override
@@ -247,7 +48,7 @@ class _OrderQRScreenState extends State<OrderQRScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: <Widget>[
                   FilledButton.icon(
-                    onPressed: () => printOrderQr(context, widget.order),
+                    onPressed: () => printOrderQr(context, order),
                     icon: const Icon(Icons.print_outlined),
                     label: const Text('พิมพ์ QR พร้อมรายละเอียดออเดอร์'),
                     style: FilledButton.styleFrom(
@@ -264,60 +65,12 @@ class _OrderQRScreenState extends State<OrderQRScreen> {
                     payload: universalQr,
                   ),
                   const SizedBox(height: 16),
-                  _OrderQrDetails(order: widget.order),
+                  _OrderQrDetails(order: order),
                 ],
               ),
             ),
           ),
-          SafeArea(
-            top: false,
-            child: Container(
-              width: double.infinity,
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-              decoration: const BoxDecoration(
-                color: Colors.white,
-                border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
-              ),
-              child: Row(
-                children: <Widget>[
-                  IconButton.filledTonal(
-                    onPressed: _voiceReady ? _toggleVoiceSession : null,
-                    icon: Icon(
-                      _voiceSessionEnabled || _isListening
-                          ? Icons.mic_rounded
-                          : Icons.mic_none_rounded,
-                    ),
-                    tooltip: _voiceSessionEnabled
-                        ? 'หยุดฟังคำสั่งเสียง'
-                        : 'เริ่มฟังคำสั่งเสียง',
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: <Widget>[
-                        Text(
-                          _voiceMessage,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 13,
-                          ),
-                        ),
-                        if (_lastVoiceText.isNotEmpty)
-                          Text(
-                            'ได้ยิน: $_lastVoiceText',
-                            style: const TextStyle(
-                              color: Color(0xFF64748B),
-                              fontSize: 12,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
+          if (voiceCommandBar != null) voiceCommandBar!,
         ],
       ),
     );
@@ -448,11 +201,6 @@ class _OrderQrDetails extends StatelessWidget {
             const Text(
               'รายการสินค้า',
               style: TextStyle(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 4),
-            _AmountRow(
-              label: 'ค่าสินค้า',
-              value: formatOrderQrMoney(layout.productSubtotal),
             ),
             const SizedBox(height: 4),
             ...layout.items.expand((item) {

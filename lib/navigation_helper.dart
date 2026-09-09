@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+import 'services/pending_registration_service.dart';
+import 'services/shop_profile_cache_service.dart';
+
 /// Helper class สำหรับตรวจสอบสถานะการลงทะเบียนและนำทางไปหน้าที่เหมาะสม
 class NavigationHelper {
   static const Duration _firestoreTimeout = Duration(seconds: 12);
@@ -14,8 +17,23 @@ class NavigationHelper {
     bool replace = true,
   }) async {
   try {
+      final cachedShop =
+          await ShopProfileCacheService.instance.loadProfile(user.uid);
+      if (_hasCompletedShopProfile(cachedShop) && context.mounted) {
+        debugPrint('Auth nav: cached shop profile, opening home');
+        _navigate(context, '/home', replace: replace);
+        unawaited(PendingRegistrationService.applyIfNeeded(user));
+        return;
+      }
+
+      final appliedServiceType =
+          await PendingRegistrationService.applyIfNeeded(user).timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => null,
+      );
+
       final shopLookup = await _fetchShopRegistration(user.uid).timeout(
-        _firestoreTimeout,
+        const Duration(seconds: 6),
       );
       final bool hasCompletedShopProfile = _hasCompletedShopProfile(shopLookup.data);
 
@@ -30,11 +48,23 @@ class NavigationHelper {
           user.providerData.any((info) => info.providerId == 'password');
 
       if (requiresEmailVerification && !user.emailVerified && context.mounted) {
+        String? serviceType = appliedServiceType;
+        if (serviceType == null) {
+          final contractDoc = await FirebaseFirestore.instance
+              .collection('contracts')
+              .doc(user.uid)
+              .get()
+              .timeout(_firestoreTimeout);
+          serviceType = contractDoc.data()?['serviceType'] as String?;
+        }
         _navigate(
           context,
           '/email-verification',
           replace: replace,
-          arguments: null,
+          arguments: {
+            'serviceType': serviceType,
+            'nextRoute': 'contract',
+          },
         );
         return;
       }
@@ -186,10 +216,14 @@ class NavigationHelper {
             .collection(col)
             .where('email', isEqualTo: email)
             .limit(1)
-            .get();
+            .get()
+            .timeout(_firestoreTimeout);
         if (snap.docs.isNotEmpty) return true;
       }
       return false;
+    } on TimeoutException {
+      debugPrint('Shop-by-email lookup timed out');
+      rethrow;
     } catch (e) {
       debugPrint('Error checking shop by email: $e');
       return false;

@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'shop_registration_screen.dart';
 import 'welcome_screen.dart';
 import 'utils/app_colors.dart';
@@ -19,6 +22,7 @@ import 'services/admin_support_config.dart';
 import 'services/security_pin_service.dart';
 import 'services/biometric_auth_service.dart';
 import 'services/shop_operations_service.dart';
+import 'services/shop_profile_cache_service.dart';
 import 'widgets/cached_app_image.dart';
 import 'widgets/operating_hours_sheet.dart';
 
@@ -48,7 +52,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _biometricLoginAvailable = false;
   bool _biometricLoginEnabled = false;
   bool _biometricLoginLoading = true;
+  String? _appVersionLabel;
   String _accountSectionTitle = 'บัญชีร้านค้า';
+  Future<_ResolvedShopDoc?>? _shopDataFuture;
+  Map<String, dynamic>? _cachedShopPreview;
 
   static const List<String> _registrationCollections = <String>[
     'market_registrations',
@@ -59,8 +66,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<_ResolvedShopDoc?> _loadShopData(User user) async {
     final String userId = user.uid;
-    final String? email = user.email?.trim().toLowerCase();
-    final String? hintedServiceType = await _resolveServiceType(userId);
+    final cached = await ShopProfileCacheService.instance.loadProfile(userId);
+    if (cached != null && cached.isNotEmpty) {
+      _cachedShopPreview = cached;
+    }
+    final String? hintedServiceType =
+        cached?['serviceType']?.toString() ??
+        await _resolveServiceType(userId);
 
     final List<String> prioritizedCollections = <String>[
       if (hintedServiceType != null)
@@ -73,13 +85,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (collection.isEmpty || visited.contains(collection)) continue;
       visited.add(collection);
       final DocumentSnapshot<Map<String, dynamic>>? doc =
-          await _findShopDocInCollection(collection, userId, email);
+          await _findShopDocInCollection(collection, userId);
       if (doc != null) {
         final String? docServiceType =
             hintedServiceType ?? doc.data()?['serviceType'] as String?;
         debugPrint(
           'SettingsScreen: found shop doc in $collection (serviceType=$docServiceType)',
         );
+        final data = doc.data();
+        if (data != null) {
+          unawaited(
+            ShopProfileCacheService.instance.saveProfile(userId, data),
+          );
+        }
         return _ResolvedShopDoc(
           doc: doc,
           collection: collection,
@@ -94,35 +112,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<DocumentSnapshot<Map<String, dynamic>>?> _findShopDocInCollection(
     String collection,
     String userId,
-    String? email,
   ) async {
-    final CollectionReference<Map<String, dynamic>> col = FirebaseFirestore
-        .instance
-        .collection(collection);
-
-    final DocumentSnapshot<Map<String, dynamic>> directDoc = await col
-        .doc(userId)
-        .get();
-    if (directDoc.exists) {
-      return directDoc;
-    }
-
-    final QuerySnapshot<Map<String, dynamic>> ownerQuery = await col
-        .where('ownerId', isEqualTo: userId)
-        .limit(1)
-        .get();
-    if (ownerQuery.docs.isNotEmpty) {
-      return ownerQuery.docs.first;
-    }
-
-    if (email != null && email.isNotEmpty) {
-      final QuerySnapshot<Map<String, dynamic>> emailQuery = await col
-          .where('email', isEqualTo: email)
-          .limit(1)
-          .get();
-      if (emailQuery.docs.isNotEmpty) {
-        return emailQuery.docs.first;
+    try {
+      final DocumentSnapshot<Map<String, dynamic>> directDoc =
+          await FirebaseFirestore.instance
+              .collection(collection)
+              .doc(userId)
+              .get()
+              .timeout(const Duration(seconds: 8));
+      if (directDoc.exists) {
+        return directDoc;
       }
+    } on TimeoutException {
+      debugPrint('SettingsScreen: timeout reading $collection/$userId');
+    } on FirebaseException catch (e) {
+      debugPrint('SettingsScreen: failed reading $collection: ${e.code}');
     }
     return null;
   }
@@ -132,7 +136,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final doc = await FirebaseFirestore.instance
           .collection('contracts')
           .doc(userId)
-          .get();
+          .get()
+          .timeout(const Duration(seconds: 5));
       return doc.data()?['serviceType'] as String?;
     } catch (e) {
       debugPrint('SettingsScreen: unable to read service type: $e');
@@ -193,7 +198,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     if (value && !_biometricLoginAvailable) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('เครื่องนี้ยังไม่พร้อมใช้ลายนิ้วมือ')),
+        const SnackBar(
+          content: Text('เครื่องนี้ยังไม่พร้อมใช้ลายนิ้วมือหรือ Face ID'),
+        ),
       );
       return;
     }
@@ -213,12 +220,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       if (value) {
         final authenticated = await _biometricAuthService.authenticate(
-          reason: 'ยืนยันลายนิ้วมือเพื่อปลดล็อกแอป',
+          reason: 'ยืนยันลายนิ้วมือหรือ Face ID เพื่อปลดล็อกแอป',
         );
         if (!authenticated) {
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('ยืนยันลายนิ้วมือไม่สำเร็จ')),
+            const SnackBar(
+              content: Text('ยืนยันลายนิ้วมือหรือ Face ID ไม่สำเร็จ'),
+            ),
           );
           return;
         }
@@ -231,8 +240,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         SnackBar(
           content: Text(
             value
-                ? 'เปิดปลดล็อกด้วยลายนิ้วมือก่อนเข้าแอปแล้ว'
-                : 'ปิดปลดล็อกด้วยลายนิ้วมือแล้ว',
+                ? 'เปิดปลดล็อกด้วยลายนิ้วมือและ Face ID ก่อนเข้าแอปแล้ว'
+                : 'ปิดปลดล็อกด้วยลายนิ้วมือและ Face ID แล้ว',
           ),
         ),
       );
@@ -424,7 +433,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _notifyNewOrders = true;
   bool _notifyLowStock = true;
   bool _emailMonthlyReports = false;
-  bool _twoFactorEnabled = false;
   DocumentReference<Map<String, dynamic>>? _shopDocRef;
   OperatingHours? _operatingHours;
   bool _operationsLoading = false;
@@ -437,10 +445,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final user = FirebaseAuth.instance.currentUser;
     _shopId = user?.uid;
     _operationsInitAttempted = _shopId != null;
+    if (user != null) {
+      _shopDataFuture = _loadShopData(user);
+      unawaited(_hydrateCachedShopPreview(user.uid));
+    }
     if (_shopId != null) {
       _loadOperationsSettings(_shopId!);
     }
     _loadBiometricLoginSettings();
+    _loadAppVersion();
+  }
+
+  Future<void> _loadAppVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
+      setState(() {
+        _appVersionLabel = '${info.version} (${info.buildNumber})';
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _hydrateCachedShopPreview(String userId) async {
+    final cached = await ShopProfileCacheService.instance.loadProfile(userId);
+    if (!mounted || cached == null || cached.isEmpty) return;
+    setState(() => _cachedShopPreview = cached);
   }
 
   Widget _buildSection({
@@ -586,10 +615,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         title: _accountSectionTitle,
                         children: [
                           FutureBuilder<_ResolvedShopDoc?>(
-                            future: _loadShopData(user),
+                            future: _shopDataFuture,
                             builder: (context, snapshot) {
                               if (snapshot.connectionState ==
-                                  ConnectionState.waiting) {
+                                      ConnectionState.waiting &&
+                                  _cachedShopPreview == null) {
                                 return const Padding(
                                   padding: EdgeInsets.all(20),
                                   child: Center(
@@ -629,6 +659,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 bookBankImageUrl = data?['bookBankImageUrl']
                                     ?.toString();
                                 final loc = data?['location'];
+                                if (loc is Map) {
+                                  lat = (loc['latitude'] as num?)?.toDouble();
+                                  lng = (loc['longitude'] as num?)?.toDouble();
+                                }
+                              } else if (_cachedShopPreview != null) {
+                                final data = _cachedShopPreview!;
+                                shopImageUrl =
+                                    ShopProfileResolver.resolveImageUrl(data);
+                                shopName = ShopProfileResolver.resolveName(
+                                  data,
+                                );
+                                shopType = data['serviceType']?.toString();
+                                phone = data['phone']?.toString();
+                                email = data['email']?.toString();
+                                description = data['description']?.toString();
+                                bookBankImageUrl = data['bookBankImageUrl']
+                                    ?.toString();
+                                final loc = data['location'];
                                 if (loc is Map) {
                                   lat = (loc['latitude'] as num?)?.toDouble();
                                   lng = (loc['longitude'] as num?)?.toDouble();
@@ -675,7 +723,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                                         shopData: shopDoc,
                                                       ),
                                                 ),
-                                              ).then((_) => setState(() {}));
+                                              ).then((_) {
+                                                final current =
+                                                    FirebaseAuth
+                                                        .instance
+                                                        .currentUser;
+                                                if (current != null) {
+                                                  _shopDataFuture =
+                                                      _loadShopData(current);
+                                                }
+                                                if (mounted) setState(() {});
+                                              });
                                             }
                                           },
                                           child: Stack(
@@ -1042,34 +1100,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           onChanged: _biometricLoginLoading
                               ? null
                               : _toggleBiometricLogin,
-                          title: const Text('ปลดล็อกด้วยลายนิ้วมือ'),
+                          title: const Text('ปลดล็อกด้วยลายนิ้วมือและ Face ID'),
                           subtitle: Text(
                             _biometricLoginLoading
-                                ? 'กำลังตรวจสอบลายนิ้วมือของเครื่อง...'
+                                ? 'กำลังตรวจสอบลายนิ้วมือและ Face ID ของเครื่อง...'
                                 : _biometricLoginAvailable
                                 ? 'ใช้ก่อนเข้าแอป (หลัง login แล้ว)'
-                                : 'เครื่องนี้ยังไม่มีลายนิ้วมือ หรือยังไม่ได้ตั้งค่าในระบบ',
+                                : 'เครื่องนี้ยังไม่มีลายนิ้วมือ/Face ID หรือยังไม่ได้ตั้งค่าในระบบ',
                           ),
-                        ),
-                        const Divider(height: 0),
-                        SwitchListTile(
-                          value: _twoFactorEnabled,
-                          onChanged: (value) =>
-                              setState(() => _twoFactorEnabled = value),
-                          title: const Text('เปิดการยืนยันตัวตน 2 ขั้นตอน'),
-                          subtitle: const Text(
-                            'ส่ง OTP เมื่อเข้าสู่ระบบจากอุปกรณ์ใหม่',
-                          ),
-                        ),
-                        const Divider(height: 0),
-                        ListTile(
-                          leading: const Icon(Icons.devices_other_outlined),
-                          title: const Text('อุปกรณ์ที่เข้าสู่ระบบอยู่'),
-                          subtitle: const Text(
-                            'ตรวจสอบและยกเลิกอุปกรณ์ที่ไม่น่าไว้วางใจ',
-                          ),
-                          trailing: const Icon(Icons.chevron_right),
-                          onTap: () {},
                         ),
                       ],
                     ),
@@ -1186,6 +1224,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                           ),
                         ),
+                        if (_appVersionLabel != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Center(
+                              child: Text(
+                                'เวอร์ชัน $_appVersionLabel',
+                                style: TextStyle(
+                                  color: Colors.grey.shade600,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                          ),
                       ],
                     ),
                   ],

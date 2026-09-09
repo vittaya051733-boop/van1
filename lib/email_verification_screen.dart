@@ -55,7 +55,9 @@ class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
         return;
       }
 
-      final result = await EmailOtpService.instance.sendOtp();
+      final result = await EmailOtpService.instance.sendOtp(
+        email: _currentEmail,
+      );
       if (!mounted) return;
 
       setState(() {
@@ -100,7 +102,10 @@ class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
     });
 
     try {
-      final result = await EmailOtpService.instance.verifyOtp(code);
+      final result = await EmailOtpService.instance.verifyOtp(
+        code,
+        email: _currentEmail,
+      );
       await _currentUser?.reload();
       final refreshedUser = FirebaseAuth.instance.currentUser;
 

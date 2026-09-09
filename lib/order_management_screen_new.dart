@@ -17,6 +17,7 @@ import 'chat_room_screen.dart';
 import 'services/chat_warmup.dart';
 import 'services/notification_service.dart';
 import 'services/shop_operations_service.dart';
+import 'main.dart';
 import 'utils/product_variant_color.dart';
 
 String _orderItemVariantLabel(OrderItem item) {
@@ -41,8 +42,59 @@ class OrderManagementScreen extends StatefulWidget {
   State<OrderManagementScreen> createState() => _OrderManagementScreenState();
 }
 
+const List<String> _shopActiveOrderStatuses = <String>[
+  'accepted',
+  'preparing',
+  'ready',
+  'delivering',
+  'awaiting_shipping_booking',
+];
+const int _shopActiveOrdersLimit = 80;
+final Map<String, QuerySnapshot<Map<String, dynamic>>>
+_prefetchedShopOrderSnapshots =
+    <String, QuerySnapshot<Map<String, dynamic>>>{};
+
+/// Warm Firestore local cache so order management opens faster.
+Future<void> prefetchShopOrdersCache(String shopId) async {
+  if (shopId.trim().isEmpty) return;
+  final activeQuery = FirebaseFirestore.instance
+      .collection('orders')
+      .where('shopOwnerId', isEqualTo: shopId)
+      .where('status', whereIn: _shopActiveOrderStatuses)
+      .orderBy('createdAt', descending: true)
+      .limit(_shopActiveOrdersLimit);
+  try {
+    final cached = await activeQuery
+        .get(const GetOptions(source: Source.cache))
+        .timeout(const Duration(milliseconds: 700));
+    if (cached.docs.isNotEmpty) {
+      _prefetchedShopOrderSnapshots[shopId] = cached;
+    }
+  } catch (_) {}
+
+  try {
+    final fresh = await activeQuery
+        .get(const GetOptions(source: Source.server))
+        .timeout(const Duration(seconds: 6));
+    _prefetchedShopOrderSnapshots[shopId] = fresh;
+  } on FirebaseException catch (error) {
+    if (error.code != 'failed-precondition') return;
+    try {
+      final fallback = await FirebaseFirestore.instance
+          .collection('orders')
+          .where('shopOwnerId', isEqualTo: shopId)
+          .limit(_shopActiveOrdersLimit)
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 6));
+      _prefetchedShopOrderSnapshots[shopId] = fallback;
+    } catch (_) {}
+  } catch (_) {}
+}
+
 class _OrderManagementScreenState extends State<OrderManagementScreen> {
   static const int _lowStockThreshold = 5;
+  static const int _activeOrdersLimit = _shopActiveOrdersLimit;
+  static const List<String> _activeOrderStatuses = _shopActiveOrderStatuses;
   static const MethodChannel _voiceAudioChannel = MethodChannel(
     'van.merchant/voice_audio',
   );
@@ -50,6 +102,13 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   static const double _voiceNoiseGateMinimumPeak = 5.5;
   static const double _voiceNoiseGateAmbientGain = 0.12;
   String? _shopId;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _ordersSubscription;
+  bool _ordersLoading = true;
+  bool _receivedServerOrders = false;
+  DateTime? _ordersWatchStartedAt;
+  String? _ordersError;
+  final Map<String, Future<_RiderContactState>> _riderContactFutures =
+      <String, Future<_RiderContactState>>{};
   ShopOperationsSettings _operationsSettings =
       ShopOperationsSettings.defaults();
   StreamSubscription<ShopOperationsSettings>? _operationsSubscription;
@@ -79,6 +138,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   bool _voiceSessionEnabled = false;
   bool _isHandlingVoiceCommand = false;
   bool _voiceRestartPending = false;
+  bool _voiceContinuesOnQr = false;
   bool _nativeVoiceAudioPrepared = false;
   int _voiceRecoverableErrorStreak = 0;
   DateTime? _lastVoiceStartAt;
@@ -147,12 +207,22 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   @override
   void initState() {
     super.initState();
-    _loadShopId();
-    // ไม่ต้องเริ่ม timer ตั้งแต่ต้น ให้ StreamBuilder จัดการ
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid != null && uid.isNotEmpty) {
+      _shopId = uid;
+      _listenOperationsSettings(uid);
+      final prefetched = _prefetchedShopOrderSnapshots[uid];
+      if (prefetched != null) {
+        _visibleOrders = _parseVisibleOrders(prefetched.docs);
+        _ordersLoading = false;
+      }
+      unawaited(_startOrdersWatch(uid));
+    }
   }
 
   @override
   void dispose() {
+    _ordersSubscription?.cancel();
     _operationsSubscription?.cancel();
     _voiceKeepAliveTimer?.cancel();
     _voiceRestartTimer?.cancel();
@@ -167,6 +237,182 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
     return _orderCardKeys.putIfAbsent(
       orderId,
       () => GlobalKey(debugLabel: 'order-card-$orderId'),
+    );
+  }
+
+  Future<void> _startOrdersWatch(String shopId) async {
+    await _ordersSubscription?.cancel();
+    _receivedServerOrders = false;
+    _ordersWatchStartedAt = DateTime.now();
+    unawaited(_showCachedOrdersWithoutBlocking(shopId));
+    _ordersSubscription = _watchShopOrders(shopId).listen(
+      _applyOrdersSnapshot,
+      onError: (Object error) {
+        if (!mounted) return;
+        debugPrint('Order management Firestore error: $error');
+        setState(() {
+          _ordersError = error.toString();
+          _ordersLoading = false;
+          _showRetryAction = true;
+        });
+      },
+    );
+  }
+
+  Future<void> _showCachedOrdersWithoutBlocking(String shopId) async {
+    try {
+      final snapshot = await _activeOrdersQuery(shopId)
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(milliseconds: 700));
+      if (!mounted || _receivedServerOrders || snapshot.docs.isEmpty) return;
+      debugPrint(
+        'Order management disk cache ${snapshot.docs.length} docs '
+        'in ${DateTime.now().difference(_ordersWatchStartedAt!).inMilliseconds}ms',
+      );
+      _applyOrdersSnapshot(snapshot);
+    } catch (_) {
+      // The real-time listener is already active; cache failure never blocks it.
+    }
+  }
+
+  void _applyOrdersSnapshot(
+    QuerySnapshot<Map<String, dynamic>> snapshot,
+  ) {
+    if (!mounted) return;
+    if (!snapshot.metadata.isFromCache) {
+      _receivedServerOrders = true;
+    }
+    if (snapshot.metadata.isFromCache &&
+        snapshot.docs.isEmpty &&
+        _visibleOrders.isNotEmpty) {
+      return;
+    }
+    final shopId = _shopId;
+    if (shopId != null) {
+      _prefetchedShopOrderSnapshots[shopId] = snapshot;
+    }
+    final orders = _parseVisibleOrders(snapshot.docs);
+    final startedAt = _ordersWatchStartedAt;
+    if (startedAt != null) {
+      debugPrint(
+        'Order management ${snapshot.metadata.isFromCache ? 'cache' : 'server'} '
+        '${snapshot.docs.length} docs in '
+        '${DateTime.now().difference(startedAt).inMilliseconds}ms',
+      );
+    }
+    _maybeAutoAcceptAwaitingShopDecisionOrders(orders);
+    setState(() {
+      _visibleOrders = orders;
+      _ordersLoading = false;
+      _ordersError = null;
+      _showRetryAction = false;
+    });
+  }
+
+  List<DetailedOrder> _parseVisibleOrders(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+  ) {
+    final orders = docs
+        .where((doc) {
+          final data = doc.data();
+          return _isShopOrderForCurrentUser(data) &&
+              !_shouldHideUnverifiedPromptPayOrder(data) &&
+              !_hasShopRejected(data) &&
+              _hasRiderAcceptedOrder(data);
+        })
+        .map(DetailedOrder.fromSnapshot)
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+    final focusOrderId = widget.focusOrderId;
+    if (focusOrderId != null && focusOrderId.isNotEmpty) {
+      orders.sort((a, b) {
+        final aFocused = a.orderId == focusOrderId ? 1 : 0;
+        final bFocused = b.orderId == focusOrderId ? 1 : 0;
+        if (aFocused != bFocused) {
+          return bFocused.compareTo(aFocused);
+        }
+        return b.createdAt.compareTo(a.createdAt);
+      });
+    }
+    return orders;
+  }
+
+  Widget _buildOrdersBody() {
+    if (_ordersError != null && _visibleOrders.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: Colors.red),
+            const SizedBox(height: 16),
+            Text('เกิดข้อผิดพลาด: $_ordersError'),
+            const SizedBox(height: 8),
+            ElevatedButton(
+              onPressed: () {
+                final shopId = _shopId;
+                if (shopId == null) return;
+                setState(() {
+                  _ordersLoading = true;
+                  _ordersError = null;
+                });
+                unawaited(_startOrdersWatch(shopId));
+              },
+              child: const Text('ลองใหม่'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_ordersLoading && _visibleOrders.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_visibleOrders.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(
+              Icons.inbox_outlined,
+              size: 64,
+              color: Colors.grey,
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'ไม่มีออเดอร์ใหม่',
+              style: TextStyle(fontSize: 18),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Shop ID: $_shopId',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final orders = _visibleOrders;
+    final hasPauseBanner = _operationsSettings.pauseNewOrders;
+    final itemCount = orders.length + (hasPauseBanner ? 1 : 0);
+
+    return ListView.builder(
+      controller: _ordersScrollController,
+      padding: const EdgeInsets.all(16),
+      itemCount: itemCount,
+      itemBuilder: (context, index) {
+        if (hasPauseBanner) {
+          if (index == 0) {
+            return _buildPauseBanner();
+          }
+          return RepaintBoundary(
+            child: _buildOrderCard(orders[index - 1]),
+          );
+        }
+        return RepaintBoundary(child: _buildOrderCard(orders[index]));
+      },
     );
   }
 
@@ -284,7 +530,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   Future<void> _ensureVoiceKeepAlive() async {
     if (!mounted || !_voiceSessionEnabled || _isHandlingVoiceCommand) return;
     final route = ModalRoute.of(context);
-    if (route != null && !route.isCurrent) return;
+    if (route != null && !route.isCurrent && !_voiceContinuesOnQr) return;
 
     final recentlyStarted =
         _lastVoiceStartAt != null &&
@@ -296,19 +542,26 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
     _scheduleVoiceRestart(message: 'กำลังเชื่อมไมค์ใหม่...');
   }
 
+  Future<void> _stopVoiceSession({String? message}) async {
+    if (!_voiceSessionEnabled && !_isListening) {
+      return;
+    }
+    _voiceSessionEnabled = false;
+    _voiceRestartPending = false;
+    _voiceRecoverableErrorStreak = 0;
+    _stopVoiceKeepAlive();
+    _voiceRestartTimer?.cancel();
+    await _stopSpeechEngine();
+    await _restoreNativeVoiceAudio();
+    if (!mounted) return;
+    _isListening = false;
+    _voiceMessage = message ?? 'ปิดการฟังคำสั่งเสียงแล้ว';
+    _publishVoicePanelDisplay();
+  }
+
   Future<void> _toggleVoiceSession() async {
     if (_voiceSessionEnabled || _isListening) {
-      _voiceSessionEnabled = false;
-      _voiceRestartPending = false;
-      _voiceRecoverableErrorStreak = 0;
-      _stopVoiceKeepAlive();
-      _voiceRestartTimer?.cancel();
-      await _stopSpeechEngine();
-      await _restoreNativeVoiceAudio();
-      if (!mounted) return;
-      _isListening = false;
-      _voiceMessage = 'ปิดการฟังคำสั่งเสียงแล้ว';
-      _publishVoicePanelDisplay();
+      await _stopVoiceSession();
       return;
     }
 
@@ -426,7 +679,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
       return;
     }
     final route = ModalRoute.of(context);
-    if (route != null && !route.isCurrent) {
+    if (route != null && !route.isCurrent && !_voiceContinuesOnQr) {
       _scheduleVoiceRestart(
         message: 'รอกลับมาหน้าจัดการออเดอร์...',
         delay: const Duration(milliseconds: 700),
@@ -603,15 +856,37 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _openOrderQr(DetailedOrder order) async {
-    await Navigator.push<void>(
+    if (!mounted) return;
+    _voiceContinuesOnQr = _voiceSessionEnabled;
+
+    final navigatorFuture = Navigator.push<void>(
       context,
       MaterialPageRoute<void>(
         builder: (context) => OrderQRScreen(
           order: order,
-          autoStartVoiceListening: _voiceSessionEnabled,
+          voiceCommandBar: _voiceSessionEnabled
+              ? _buildVoiceCommandPanel()
+              : null,
         ),
       ),
     );
+
+    if (_voiceSessionEnabled) {
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (mounted && _voiceSessionEnabled) {
+        _isHandlingVoiceCommand = false;
+        _scheduleVoiceRestart(
+          message: 'หน้า QR — พูด ย้อนกลับ เพื่อกลับหน้าออเดอร์',
+        );
+      }
+    }
+
+    await navigatorFuture;
+    _voiceContinuesOnQr = false;
+    if (!mounted) return;
+    if (_voiceSessionEnabled) {
+      _scheduleVoiceRestart(message: 'พร้อมฟังคำสั่ง');
+    }
   }
 
   Future<void> _chatVisibleOrderRider() async {
@@ -640,6 +915,23 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _handleVoiceBackNavigation() async {
+    if (!mounted) return;
+
+    if (_voiceContinuesOnQr) {
+      final rootNavigator = MyApp.navigatorKey.currentState;
+      if (rootNavigator != null && rootNavigator.canPop()) {
+        rootNavigator.pop();
+        _setVoiceMessage('กลับหน้าจัดการออเดอร์แล้ว');
+        return;
+      }
+      final navigator = Navigator.of(context);
+      if (navigator.canPop()) {
+        navigator.pop();
+        _setVoiceMessage('กลับหน้าจัดการออเดอร์แล้ว');
+      }
+      return;
+    }
+
     final navigator = Navigator.of(context);
     if (await navigator.maybePop()) {
       return;
@@ -1023,14 +1315,38 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
     );
   }
 
-  Future<void> _loadShopId() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      setState(() {
-        _shopId = user.uid;
-      });
-      _listenOperationsSettings(user.uid);
+  Stream<QuerySnapshot<Map<String, dynamic>>> _watchShopOrders(String shopId) async* {
+    try {
+      await for (final snapshot in _activeOrdersQuery(shopId).snapshots()) {
+        yield snapshot;
+      }
+    } on FirebaseException catch (error) {
+      if (error.code != 'failed-precondition') {
+        rethrow;
+      }
+      debugPrint(
+        'Active orders index missing, falling back to shopOwnerId query: $error',
+      );
+      await for (final snapshot in _legacyOrdersQuery(shopId).snapshots()) {
+        yield snapshot;
+      }
     }
+  }
+
+  Query<Map<String, dynamic>> _activeOrdersQuery(String shopId) {
+    return FirebaseFirestore.instance
+        .collection('orders')
+        .where('shopOwnerId', isEqualTo: shopId)
+        .where('status', whereIn: _activeOrderStatuses)
+        .orderBy('createdAt', descending: true)
+        .limit(_activeOrdersLimit);
+  }
+
+  Query<Map<String, dynamic>> _legacyOrdersQuery(String shopId) {
+    return FirebaseFirestore.instance
+        .collection('orders')
+        .where('shopOwnerId', isEqualTo: shopId)
+        .limit(_activeOrdersLimit);
   }
 
   void _listenOperationsSettings(String shopId) {
@@ -1090,125 +1406,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
       ),
       backgroundColor: Colors.white,
       bottomNavigationBar: _buildVoiceCommandPanel(),
-      body: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection('orders')
-            .where('shopOwnerId', isEqualTo: _shopId)
-            .snapshots(),
-        builder: (context, snapshot) {
-          // Debug: แสดง error ถ้ามี
-          if (snapshot.hasError) {
-            _showRetryAction = true;
-            _visibleOrders = <DetailedOrder>[];
-            print('❌ Firestore Error: ${snapshot.error}');
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.error_outline, size: 48, color: Colors.red),
-                  const SizedBox(height: 16),
-                  Text('เกิดข้อผิดพลาด: ${snapshot.error}'),
-                  const SizedBox(height: 8),
-                  ElevatedButton(
-                    onPressed: () => setState(() {}),
-                    child: const Text('ลองใหม่'),
-                  ),
-                ],
-              ),
-            );
-          }
-
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            _showRetryAction = false;
-            _visibleOrders = <DetailedOrder>[];
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          // Debug: แสดงจำนวนเอกสาร
-          print('📦 Orders found: ${snapshot.data?.docs.length ?? 0}');
-          print('🔑 Current shopId: $_shopId');
-
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-            _showRetryAction = false;
-            _visibleOrders = <DetailedOrder>[];
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(
-                    Icons.inbox_outlined,
-                    size: 64,
-                    color: Colors.grey,
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'ไม่มีออเดอร์ใหม่',
-                    style: TextStyle(fontSize: 18),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Shop ID: $_shopId',
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
-                  ),
-                ],
-              ),
-            );
-          }
-
-          final orders =
-              snapshot.data!.docs
-                  .where((doc) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    return _isShopOrderForCurrentUser(data) &&
-                        !_shouldHideUnverifiedPromptPayOrder(data) &&
-                        !_hasShopRejected(data) &&
-                        _hasRiderAcceptedOrder(data);
-                  })
-                  .map(
-                    (doc) => DetailedOrder.fromSnapshot(
-                      doc as DocumentSnapshot<Map<String, dynamic>>,
-                    ),
-                  )
-                  .toList()
-                ..sort(
-                  (a, b) => b.createdAt.compareTo(a.createdAt),
-                ); // เรียงใน Dart แทน
-
-          final focusOrderId = widget.focusOrderId;
-          if (focusOrderId != null && focusOrderId.isNotEmpty) {
-            orders.sort((a, b) {
-              final aFocused = a.orderId == focusOrderId ? 1 : 0;
-              final bFocused = b.orderId == focusOrderId ? 1 : 0;
-              if (aFocused != bFocused) {
-                return bFocused.compareTo(aFocused);
-              }
-              return b.createdAt.compareTo(a.createdAt);
-            });
-          }
-
-          _maybeAutoAcceptAwaitingShopDecisionOrders(orders);
-          _showRetryAction = false;
-          _visibleOrders = orders;
-
-          final hasPauseBanner = _operationsSettings.pauseNewOrders;
-          final itemCount = orders.length + (hasPauseBanner ? 1 : 0);
-
-          return ListView.builder(
-            controller: _ordersScrollController,
-            padding: const EdgeInsets.all(16),
-            itemCount: itemCount,
-            itemBuilder: (context, index) {
-              if (hasPauseBanner) {
-                if (index == 0) {
-                  return _buildPauseBanner();
-                }
-                return _buildOrderCard(orders[index - 1]);
-              }
-              return _buildOrderCard(orders[index]);
-            },
-          );
-        },
-      ),
+      body: _buildOrdersBody(),
     );
   }
 
@@ -1722,10 +1920,35 @@ class _AmountRow extends StatelessWidget {
 
 // ย้าย _buildActionButtons กลับไปที่ _OrderManagementScreenState
 extension on _OrderManagementScreenState {
-  Future<_RiderContactState> _loadRiderContactState(DetailedOrder order) async {
+  Future<_RiderContactState> _loadRiderContactState(DetailedOrder order) {
     final riderId = order.driverId?.trim();
     if (riderId == null || riderId.isEmpty) {
-      return const _RiderContactState(profile: null, phone: null);
+      return Future<_RiderContactState>.value(
+        const _RiderContactState(profile: null, phone: null),
+      );
+    }
+    return _riderContactFutures.putIfAbsent(
+      riderId,
+      () => _fetchRiderContactState(order),
+    );
+  }
+
+  Future<_RiderContactState> _fetchRiderContactState(DetailedOrder order) async {
+    final riderId = order.driverId!.trim();
+    final embeddedName = order.driverName?.trim();
+    final embeddedPhone = order.driverPhone?.trim();
+    if (embeddedName != null &&
+        embeddedName.isNotEmpty &&
+        embeddedPhone != null &&
+        embeddedPhone.isNotEmpty) {
+      return _RiderContactState(
+        profile: UserProfile(
+          uid: riderId,
+          displayName: embeddedName,
+          phoneNumber: embeddedPhone,
+        ),
+        phone: embeddedPhone,
+      );
     }
 
     UserProfile? profile;
@@ -1748,11 +1971,12 @@ extension on _OrderManagementScreenState {
       displayName: (order.driverName?.trim().isNotEmpty ?? false)
           ? order.driverName!.trim()
           : 'ไรเดอร์',
-      phoneNumber: null,
+      phoneNumber: order.driverPhone,
     );
 
     final phoneCandidates = <String?>[
       profile.phoneNumber,
+      order.driverPhone,
       riderData?['phoneNumber'] as String?,
       riderData?['phone'] as String?,
       riderData?['contactPhone'] as String?,
@@ -1887,17 +2111,7 @@ extension on _OrderManagementScreenState {
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: () {
-              Navigator.push<void>(
-                context,
-                MaterialPageRoute<void>(
-                  builder: (context) => OrderQRScreen(
-                    order: order,
-                    autoStartVoiceListening: _voiceSessionEnabled,
-                  ),
-                ),
-              );
-            },
+            onPressed: () => unawaited(_openOrderQr(order)),
             icon: const Icon(Icons.qr_code_2_rounded),
             label: const Text('แสดง QR'),
             style: OutlinedButton.styleFrom(

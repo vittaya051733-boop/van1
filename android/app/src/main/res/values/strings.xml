@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">แว๊นตลาด\nร้านค้า</string>
+    <string name="app_name">แว๊นตลาดร้านค้า</string>
     <string name="facebook_app_id">4362533627406092</string>
     <string name="facebook_client_token">fea2d2cce3e10bf12e9a24a8ef1fc55f</string>
     <string name="fb_login_protocol_scheme">fb4362533627406092</string>

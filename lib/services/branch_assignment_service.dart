@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -136,6 +137,10 @@ class BranchAssignmentService {
 
     return Geolocator.getCurrentPosition(
       desiredAccuracy: LocationAccuracy.high,
+      timeLimit: const Duration(seconds: 10),
+    ).timeout(
+      const Duration(seconds: 12),
+      onTimeout: () => throw TimeoutException('GPS timeout'),
     );
   }
 

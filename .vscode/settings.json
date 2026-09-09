@@ -1,4 +1,8 @@
 {
+  "dart.flutterSdkPath": "/Users/tam/development/flutter",
+  "dart.flutterSdkPaths": [
+    "/Users/tam/development/flutter"
+  ],
   "IDX.agenticWorkspace": true,
   "java.import.gradle.enabled": false,
   "java.import.exclusions": [

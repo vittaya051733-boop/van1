@@ -33,6 +33,14 @@ class NotificationsScreen extends StatefulWidget {
 
 class _NotificationsScreenState extends State<NotificationsScreen> {
   static const String _targetApp = 'van1';
+  static const Set<String> _walletActions = {
+    'payout_pending',
+    'payout_paid',
+    'credit_released',
+    'top_up_verified',
+    'credit_adjusted',
+    'security_deposit_paid',
+  };
   User? _currentUser;
   final NotificationService _notificationService = NotificationService();
   _NotificationFilter _selectedFilter = _NotificationFilter.all;
@@ -120,14 +128,15 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     if (type == 'call' || action == 'incoming_call') {
       return _NotificationCategory.call;
     }
+    if (_walletActions.contains(action)) {
+      return _NotificationCategory.system;
+    }
     if (hasOrderId ||
         <String>{
           'order_accepted',
           'order_rejected',
           'shop_rejected_order',
           'shop_accepted_order',
-          'payout_pending',
-          'payout_paid',
           'low_stock_alert',
         }.contains(action)) {
       return _NotificationCategory.order;
@@ -304,7 +313,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     }
 
     final action = (data['action'] as String?)?.trim() ?? '';
-    if (action == 'payout_pending' || action == 'payout_paid') {
+    if (_walletActions.contains(action)) {
       if (!mounted) {
         return;
       }

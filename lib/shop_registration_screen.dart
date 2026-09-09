@@ -1,16 +1,15 @@
+import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:http/http.dart' as http;
 import 'map_picker_screen.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img; // เพิ่ม: สำหรับแปลงรูปภาพ
-import 'firebase_options.dart';
 import 'utils/app_colors.dart';
 import 'utils/shop_profile_resolver.dart';
 import 'services/shop_profile_fetcher.dart';
@@ -37,6 +36,7 @@ class ShopRegistrationScreen extends StatefulWidget {
 }
 
 class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
+  static const Duration _firestoreTimeout = Duration(seconds: 12);
   static const List<String> _nameKeys = <String>[
     'shopName',
     'name',
@@ -143,68 +143,7 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
   String? _resolvedServiceType;
   bool _hasAttemptedRemotePrefill = false;
 
-  // เก็บผล OCR จากรูปสมุดบัญชี
-  String _ocrText = '';
-
-  // อ่านข้อความด้วย Google Cloud Vision API
-  Future<String> _extractTextWithBestOCR(File imageFile) async {
-    return await _extractTextWithGoogleVisionAPI(imageFile);
-  }
-
-  // เรียก Google Cloud Vision API เพื่ออ่านข้อความจากรูป
-  Future<String> _extractTextWithGoogleVisionAPI(File imageFile) async {
-    // แก้ไข: อ่าน API Key จาก DefaultFirebaseOptions.currentPlatform.apiKey
-    final apiKey = DefaultFirebaseOptions.currentPlatform.apiKey;
-
-    // เพิ่มการตรวจสอบว่าได้ตั้งค่า API Key มาจาก --dart-define หรือไม่
-    if (apiKey.isEmpty) {
-      throw Exception(
-        'Google Cloud Vision API Key ไม่ได้ถูกตั้งค่าใน firebase_options.dart',
-      );
-    }
-
-    final bytes = await imageFile.readAsBytes();
-    final base64Image = base64Encode(bytes);
-    final url = Uri.parse(
-      'https://vision.googleapis.com/v1/images:annotate?key=$apiKey',
-    );
-    final requestBody = jsonEncode({
-      'requests': [
-        {
-          'image': {'content': base64Image},
-          'features': [
-            // แก้ไข: เปลี่ยนเป็น DOCUMENT_TEXT_DETECTION เพื่อความแม่นยำในเอกสาร
-            {'type': 'DOCUMENT_TEXT_DETECTION'},
-          ],
-        },
-      ],
-    });
-
-    final response = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: requestBody,
-    );
-    if (response.statusCode == 200) {
-      final jsonResponse = jsonDecode(response.body);
-      final textAnnotations =
-          jsonResponse['responses']?[0]?['textAnnotations'] as List?;
-      if (textAnnotations == null || textAnnotations.isEmpty) {
-        return '';
-      }
-      final fullText = textAnnotations[0]['description'] as String;
-      return fullText;
-    } else {
-      // เพิ่มการแสดง error จาก API เพื่อให้ debug ง่ายขึ้น
-      debugPrint('Google Vision API Error: ${response.body}');
-      return '';
-    }
-  }
-
-  // ข้อความแจ้งเตือนแบบ real-time
-  String? _bankNameError;
-  String? _accountNumberError;
-  String? _accountOwnerError;
+  static const double _bookBankMinSharpnessStdDev = 20;
 
   // พิกัด GPS
   double? _latitude;
@@ -285,8 +224,11 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
         final snapshot = await FirebaseFirestore.instance
             .collection('contracts')
             .doc(user.uid)
-            .get();
+            .get()
+            .timeout(_firestoreTimeout);
         serviceType = (snapshot.data()?['serviceType'] as String?)?.trim();
+      } on TimeoutException {
+        debugPrint('Timed out loading serviceType from contracts');
       } catch (e) {
         debugPrint('Failed to load serviceType: $e');
       }
@@ -306,7 +248,8 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
       final doc = await FirebaseFirestore.instance
           .collection(collection)
           .doc(user.uid)
-          .get();
+          .get()
+          .timeout(_firestoreTimeout);
       if (doc.exists) {
         final Map<String, dynamic>? data = doc.data();
         final alreadyComplete = _hasCompletedProfile(data);
@@ -317,6 +260,8 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
           return;
         }
       }
+    } on TimeoutException {
+      debugPrint('Timed out checking existing registration');
     } catch (e) {
       debugPrint('Failed to check existing registration: $e');
     }
@@ -417,8 +362,24 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
     }
   }
 
+  Future<bool> _isBookBankImageBlurry(File imageFile) async {
+    final bytes = await imageFile.readAsBytes();
+    final image = img.decodeImage(bytes);
+    if (image == null) return true;
+
+    final grayscale = img.grayscale(image);
+    final pixels = grayscale.getBytes();
+    if (pixels.isEmpty) return true;
+
+    final mean = pixels.reduce((a, b) => a + b) / pixels.length;
+    final variance =
+        pixels.map((p) => (p - mean) * (p - mean)).reduce((a, b) => a + b) /
+        pixels.length;
+    final stddev = math.sqrt(variance);
+    return stddev < _bookBankMinSharpnessStdDev;
+  }
+
   Future<void> _pickBookBankImage() async {
-    // ลบโค้ดขอ permission ออก (ใช้ ImagePicker ตามปกติ)
     final ImagePicker picker = ImagePicker();
     final XFile? image = await picker.pickImage(
       source: ImageSource.gallery,
@@ -426,162 +387,60 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
       maxHeight: 1400,
       imageQuality: 90,
     );
-    if (image != null) {
-      setState(() {
-        _selectedBookBankImage = File(image.path);
-        _isUploadingBookBank = true;
-      });
-      try {
-        final ocrText = await _extractTextWithBestOCR(_selectedBookBankImage!);
-        if (ocrText.trim().isEmpty || ocrText.length < 20) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).clearSnackBars();
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  '❌ ไม่สามารถอ่านข้อมูลจากรูปสมุดบัญชี หรือภาพเบลอ กรุณาเลือกรูปใหม่',
-                ),
-                backgroundColor: Colors.red,
-              ),
-            );
-            setState(() {
-              _selectedBookBankImage = null;
-              _ocrText = '';
-              _isUploadingBookBank = false;
-            });
-          }
-          return;
-        }
-        if (mounted) {
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('✅ รูปภาพสมุดบัญชีผ่านการตรวจสอบความชัดเจน'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
-      } catch (e) {
-        // ... โค้ดส่วนที่เหลือไม่มีการเปลี่ยนแปลง ...
-        if (mounted) {
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('❌ เกิดข้อผิดพลาดในการตรวจสอบรูปภาพ'),
-              backgroundColor: Colors.red,
-            ),
-          );
-          setState(() {
-            _selectedBookBankImage = null;
-            _ocrText = '';
-            _isUploadingBookBank = false;
-          });
-        }
-      } finally {
-        if (mounted) {
-          setState(() {
-            _isUploadingBookBank = false;
-          });
-        }
-      }
-    } // ปิด if (image != null)
-  } // ปิด _pickBookBankImage
-
-  void _validateFieldAgainstOCR(String fieldName) {
-    if (_ocrText.isEmpty || _selectedBookBankImage == null) return;
-
-    final lowerOcr = _ocrText.toLowerCase();
+    if (image == null) return;
 
     setState(() {
-      if (fieldName == 'bank' || fieldName == 'all') {
-        final raw = _bankNameController.text.trim();
-        if (raw.isEmpty) {
-          _bankNameError = null;
-        } else {
-          final cleaned = raw
-              .toLowerCase()
-              .replaceAll(RegExp(r'\([^)]*\)'), '')
-              .replaceAll('ธนาคาร', '')
-              .replaceAll('ธ.ก.ส.', 'ธกส')
-              .replaceAll(RegExp(r'[^\u0E00-\u0E7Fa-z0-9\s]'), '')
-              .trim();
-          final matchesBank = cleaned
-              .split(RegExp(r'\s+'))
-              .where((segment) => segment.length >= 3)
-              .any((segment) => lowerOcr.contains(segment));
-          _bankNameError = matchesBank
-              ? null
-              : 'ชื่อธนาคารไม่ตรงกับรูปสมุดบัญชี';
-        }
-      }
-
-      if (fieldName == 'account' || fieldName == 'all') {
-        final digits = _accountNumberController.text.replaceAll(
-          RegExp(r'[\s\-\.]'),
-          '',
-        );
-        if (digits.length >= 8) {
-          final ocrDigits = _ocrText.replaceAll(RegExp(r'\D'), '');
-          final minMatch = (digits.length * 0.5).round().clamp(
-            4,
-            digits.length,
-          );
-          final hasExact = ocrDigits.contains(digits);
-          final hasPartial =
-              hasExact ||
-              List.generate(
-                digits.length - minMatch + 1,
-                (i) => digits.substring(i, i + minMatch),
-              ).any(ocrDigits.contains) ||
-              (digits.length >= 10 &&
-                  List.generate(
-                    digits.length - 3,
-                    (i) => digits.substring(i, i + 4),
-                  ).any(ocrDigits.contains));
-          _accountNumberError = hasPartial
-              ? null
-              : 'หมายเลขบัญชีไม่ตรงกับรูปสมุดบัญชี';
-        } else {
-          _accountNumberError = null;
-        }
-      }
-
-      if (fieldName == 'owner' || fieldName == 'all') {
-        final owner = _accountOwnerController.text.trim().toLowerCase();
-        if (owner.isEmpty) {
-          _accountOwnerError = null;
-        } else {
-          final tokens = owner
-              .split(RegExp(r'\s+'))
-              .where((t) => t.isNotEmpty)
-              .toList();
-          final required = (tokens.length * 0.4).ceil();
-          int matches = 0;
-
-          for (final token in tokens) {
-            if (['นาย', 'นาง', 'นางสาว', 'mr', 'mrs', 'miss'].contains(token)) {
-              matches++;
-              continue;
-            }
-            if (token.length >= 2 && lowerOcr.contains(token)) {
-              matches++;
-            }
-          }
-
-          _accountOwnerError = matches >= required
-              ? null
-              : 'ชื่อเจ้าของบัญชีไม่ตรงกับรูปสมุดบัญชี';
-        }
-      }
+      _selectedBookBankImage = File(image.path);
+      _isUploadingBookBank = true;
     });
+
+    try {
+      final blurry = await _isBookBankImageBlurry(_selectedBookBankImage!);
+      if (blurry) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('❌ ภาพเบลอหรือไม่ชัด กรุณาเลือกรูปใหม่'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        setState(() {
+          _selectedBookBankImage = null;
+        });
+        return;
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('✅ รูปภาพสมุดบัญชีผ่านการตรวจสอบความชัดเจน'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('❌ เกิดข้อผิดพลาดในการตรวจสอบรูปภาพ'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      setState(() {
+        _selectedBookBankImage = null;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploadingBookBank = false;
+        });
+      }
+    }
   }
 
   Future<void> _pickLocationFromMap() async {
-    // ก่อนเปิดแผนที่ ให้ตรวจสอบชื่อเจ้าของบัญชีที่กรอกไปแล้ว
-    if (_accountOwnerController.text.isNotEmpty && _ocrText.isNotEmpty) {
-      _validateFieldAgainstOCR('owner');
-    }
-
     final result = await Navigator.of(context).push<Map<String, double>>(
       MaterialPageRoute(
         builder: (context) => MapPickerScreen(
@@ -610,11 +469,8 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
     // 1. ตรวจสอบ FormFields ทั้งหมดด้วย validator
     final formIsValid = _formKey.currentState?.validate() ?? false;
 
-    // 2. ตรวจสอบ OCR-based errors อีกครั้ง (เพื่อให้แน่ใจว่าอัปเดตล่าสุด)
-    _validateFieldAgainstOCR('all');
-
-    // 3. รวบรวมข้อผิดพลาดทั้งหมด (จาก FormFields และ OCR-based)
-    final allErrors = _collectAllValidationErrors();
+    // 2. รวบรวมข้อผิดพลาดทั้งหมดจาก FormFields
+    final allErrors = _validateFields();
     if (!formIsValid || allErrors.isNotEmpty) {
       _showValidationDialog(allErrors);
       return; // หยุดการทำงานถ้ามีข้อผิดพลาด
@@ -861,26 +717,6 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
     // หมายเหตุ: คำอธิบายร้าน ไม่บังคับ ตามที่ผู้ใช้ระบุ
     // สมุดบัญชีธนาคาร: อนุญาตให้เว้นได้ (ไม่บังคับ)
 
-    return errors;
-  }
-
-  // รวบรวมข้อผิดพลาดทั้งหมดจากทั้ง FormFields และ OCR-based errors
-  List<String> _collectAllValidationErrors() {
-    final errors = _validateFields(); // รวบรวมข้อผิดพลาดพื้นฐาน
-
-    // เพิ่มข้อผิดพลาดจาก OCR-based validation
-    if (_bankNameError != null) {
-      errors.add('• ธนาคาร: $_bankNameError');
-    }
-    if (_accountNumberError != null) {
-      errors.add('• หมายเลขบัญชี: $_accountNumberError');
-    }
-    if (_accountOwnerError != null) {
-      errors.add('• ชื่อเจ้าของบัญชี: $_accountOwnerError');
-    }
-
-    // ตรวจสอบว่ามีรูปสมุดบัญชีหรือไม่ ถ้ามีแต่ข้อมูลไม่ครบ ก็ควรแจ้ง
-    // (แต่ตอนนี้ OCR validation จะจัดการเรื่องนี้อยู่แล้ว)
     return errors;
   }
 
@@ -1401,7 +1237,6 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
                         labelText: 'ชื่อธนาคาร *',
                         hintText: 'เลือกชื่อธนาคาร',
                         prefixIcon: const Icon(Icons.account_balance),
-                        errorText: _bankNameError,
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                         ),
@@ -1410,7 +1245,6 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
                         setState(() {
                           _bankNameController.text = value ?? '';
                         });
-                        _validateFieldAgainstOCR('bank');
                       },
                       validator: (value) {
                         // แก้ไข: ตรวจสอบจาก controller โดยตรง
@@ -1439,20 +1273,10 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
                           color: Colors.grey.shade600,
                         ),
                         prefixIcon: const Icon(Icons.credit_card),
-                        errorText: _accountNumberError,
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
-                      onTap: () {
-                        if (_bankNameController.text.isNotEmpty &&
-                            _ocrText.isNotEmpty) {
-                          _validateFieldAgainstOCR('bank');
-                        }
-                      },
-                      onChanged: (value) {
-                        _validateFieldAgainstOCR('account');
-                      },
                       validator: (value) {
                         if (value == null || value.trim().isEmpty) {
                           return 'กรุณากรอกหมายเลขบัญชี';
@@ -1479,20 +1303,10 @@ class _ShopRegistrationScreenState extends State<ShopRegistrationScreen> {
                         hintText: 'เช่น นาย สมชาย ใจดี',
                         helperText: 'ใส่ได้เฉพาะตัวอักษรไทย/อังกฤษ',
                         prefixIcon: const Icon(Icons.person),
-                        errorText: _accountOwnerError,
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
-                      onTap: () {
-                        if (_accountNumberController.text.isNotEmpty &&
-                            _ocrText.isNotEmpty) {
-                          _validateFieldAgainstOCR('account');
-                        }
-                      },
-                      onChanged: (value) {
-                        _validateFieldAgainstOCR('owner');
-                      },
                       validator: (value) {
                         if (value == null || value.trim().isEmpty) {
                           return 'กรุณากรอกชื่อเจ้าของบัญชี';

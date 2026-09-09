@@ -1,3 +1,4 @@
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import 'package:blue_thermal_printer/blue_thermal_printer.dart';
@@ -22,29 +23,41 @@ String orderQrCodeText(DetailedOrder order) {
   return 'VAN_ORDER:${order.orderId}|$orderCode|${order.totalAmount.toStringAsFixed(2)}';
 }
 
+/// Use the exact same payload shown on the rider QR screen.
+String orderQrPrintPayload(DetailedOrder order) {
+  return orderQrCodeText(order);
+}
+
 Future<void> printOrderQr(BuildContext context, DetailedOrder order) async {
-  final universalQr = orderQrCodeText(order);
+  final printQr = orderQrPrintPayload(order);
   final receiptLayout = buildOrderQrReceiptLayout(order);
   ScaffoldMessengerState? progressMessenger;
 
   try {
-    final receiptPng = await buildOrderQrReceiptPngBytes(
-      qrPayload: universalQr,
+    final receipt = await buildOrderQrReceiptPngBytes(
+      qrPayload: printQr,
       layout: receiptLayout,
       receiptTitle: orderQrReceiptTitle,
     );
 
     if (!context.mounted) return;
-    final channel = await showMerchantPrintOptionsSheet(context);
+    final savedBleReady = Platform.isIOS &&
+        await MerchantThermalPrinterService.instance.hasBlePrinterReady();
+    final MerchantPrintChannel? channel = savedBleReady
+        ? MerchantPrintChannel.bluetoothBle
+        : await showMerchantPrintOptionsSheet(context);
     if (channel == null || !context.mounted) return;
 
     progressMessenger = ScaffoldMessenger.of(context);
+    final bleReady = savedBleReady ||
+        (channel == MerchantPrintChannel.bluetoothBle &&
+            await MerchantThermalPrinterService.instance.hasBlePrinterReady());
     progressMessenger.showSnackBar(
-      const SnackBar(
-        duration: Duration(seconds: 30),
+      SnackBar(
+        duration: const Duration(seconds: 30),
         content: Row(
           children: <Widget>[
-            SizedBox(
+            const SizedBox(
               width: 18,
               height: 18,
               child: CircularProgressIndicator(
@@ -52,8 +65,16 @@ Future<void> printOrderQr(BuildContext context, DetailedOrder order) async {
                 color: Colors.white,
               ),
             ),
-            SizedBox(width: 12),
-            Text('กำลังค้นหาและเชื่อมต่อเครื่องพิมพ์...'),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                bleReady
+                    ? 'กำลังพิมพ์...'
+                    : channel == MerchantPrintChannel.bluetoothBle
+                        ? 'กำลังเชื่อมต่อเครื่องพิมพ์...'
+                        : 'กำลังค้นหาและเชื่อมต่อเครื่องพิมพ์...',
+              ),
+            ),
           ],
         ),
       ),
@@ -61,24 +82,24 @@ Future<void> printOrderQr(BuildContext context, DetailedOrder order) async {
 
     switch (channel) {
       case MerchantPrintChannel.bluetoothClassic:
-        await _printReceiptViaBluetooth(context, receiptPng);
+        await _printReceiptViaBluetooth(context, receipt.pngBytes);
       case MerchantPrintChannel.bluetoothBle:
         await MerchantThermalPrinterService.instance.printViaBle(
           context,
-          receiptPng,
+          receipt.pngBytes,
         );
       case MerchantPrintChannel.wifi:
         await MerchantThermalPrinterService.instance.printViaWifi(
           context,
-          receiptPng,
+          receipt.pngBytes,
         );
       case MerchantPrintChannel.usb:
         await MerchantThermalPrinterService.instance.printViaUsb(
           context,
-          receiptPng,
+          receipt.pngBytes,
         );
       case MerchantPrintChannel.system:
-        await _printReceiptViaSystemPrint(context, receiptPng);
+        await _printReceiptViaSystemPrint(context, receipt.pngBytes);
     }
   } on PrinterUserException catch (error) {
     if (context.mounted) {

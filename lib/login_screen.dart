@@ -6,6 +6,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'navigation_helper.dart';
+import 'utils/apple_sign_in_errors.dart';
 import 'utils/app_colors.dart';
 import 'utils/phone_login_helper.dart';
 import 'apple_auth.dart';
@@ -177,12 +178,14 @@ class _LoginScreenState extends State<LoginScreen> {
             ? _androidServerClientId
             : null,
         clientId: defaultTargetPlatform == TargetPlatform.iOS ? _iosClientId : null,
-      );
+      ).timeout(const Duration(seconds: 20));
       if (!googleSignIn.supportsAuthenticate()) {
         throw Exception('แพลตฟอร์มนี้ไม่รองรับ Google Sign-In');
       }
 
-      final googleUser = await googleSignIn.authenticate();
+      final googleUser = await googleSignIn.authenticate().timeout(
+        const Duration(seconds: 90),
+      );
       final googleAuth = googleUser.authentication;
       final idToken = googleAuth.idToken;
       if (idToken == null || idToken.isEmpty) {
@@ -228,6 +231,8 @@ class _LoginScreenState extends State<LoginScreen> {
     });
 
     try {
+      if (!await confirmAppleSignInOnSimulator(context)) return;
+
       await signInWithApple();
       if (!mounted) {
         return;
@@ -239,16 +244,11 @@ class _LoginScreenState extends State<LoginScreen> {
           e.code == 'auth/redirect-initiated') {
         return;
       }
-      if (e.code == 'account-exists-with-different-credential' ||
-          e.code == 'auth/account-exists-with-different-credential') {
-        _showSnack('อีเมลนี้ใช้วิธีเข้าสู่ระบบอื่นอยู่แล้ว กรุณาเข้าสู่ระบบด้วยวิธีเดิม');
-        return;
-      }
       debugPrint('Apple sign-in failed: ${e.code}');
-      _showSnack('ไม่สามารถเข้าสู่ระบบด้วย Apple ได้ (${e.code})');
+      _showSnack(mapAppleSignInErrorMessage(e));
     } catch (e) {
       debugPrint('Unexpected Apple sign-in error: $e');
-      _showSnack('ไม่สามารถเข้าสู่ระบบด้วย Apple ได้');
+      _showSnack(mapAppleSignInErrorMessage(e));
     } finally {
       if (mounted) {
         setState(() {
@@ -280,7 +280,8 @@ class _LoginScreenState extends State<LoginScreen> {
       }
 
       // ตรวจสอบว่าเคยลงทะเบียนร้านหรือยัง
-      final eligible = await NavigationHelper.isShopRegisteredByEmail(email);
+      final eligible = await NavigationHelper.isShopRegisteredByEmail(email)
+          .timeout(const Duration(seconds: 12));
       if (!mounted) return;
       if (!eligible) {
         // ถ้ายังไม่เคยลงทะเบียนร้าน → ออกจากระบบและกลับไปหน้า welcome
@@ -292,6 +293,10 @@ class _LoginScreenState extends State<LoginScreen> {
         return;
       }
       // ถ้าเคยลงทะเบียนแล้ว → เข้าสู่ระบบได้
+      Navigator.of(context).pushNamedAndRemoveUntil('/home', (route) => false);
+    } on TimeoutException {
+      debugPrint('Post-login shop lookup timed out; continuing to home');
+      if (!mounted) return;
       Navigator.of(context).pushNamedAndRemoveUntil('/home', (route) => false);
     } catch (e) {
       debugPrint('Post-login eligibility check failed: $e');

@@ -2,8 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:van1/data/merchant_security_deposit.dart';
 
 void main() {
-  test('security deposit requires 1000 baht', () {
-    expect(MerchantSecurityDepositPolicy.requiredAmountBaht, 1000);
+  test('security deposit default is 1000 baht when admin config missing', () {
+    expect(MerchantSecurityDepositPolicy.defaultRequiredAmountBaht, 1000);
   });
 
   test('package includes printer, apron, and qr sign', () {

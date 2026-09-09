@@ -120,21 +120,35 @@ class MerchantBluetoothPrinterService {
     return selected;
   }
 
+  String? _connectedAddress;
+
   Future<void> connect(BluetoothDevice device) async {
     try {
       final connected = await _printer.isConnected;
+      final address = device.address?.trim();
+      if (connected == true &&
+          address != null &&
+          address.isNotEmpty &&
+          _connectedAddress == address) {
+        return;
+      }
       if (connected == true) {
         try {
           await _printer.disconnect();
         } catch (_) {}
+        _connectedAddress = null;
       }
       await _printer.connect(device);
+      _connectedAddress = address;
+      await Future<void>.delayed(const Duration(milliseconds: 800));
     } on PlatformException catch (error) {
+      _connectedAddress = null;
       throw PrinterUserException(_friendlyConnectError(error));
     }
   }
 
   Future<void> disconnectSilently() async {
+    _connectedAddress = null;
     try {
       await _printer.disconnect();
     } catch (_) {}

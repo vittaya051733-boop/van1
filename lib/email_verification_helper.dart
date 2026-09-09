@@ -48,7 +48,7 @@ class _EmailVerificationHelperState extends State<EmailVerificationHelper> {
 
     setState(() => _loading = true);
     try {
-      await EmailOtpService.instance.sendOtp();
+      await EmailOtpService.instance.sendOtp(email: email);
       _showMessage('ส่ง OTP ใหม่ไปที่ $email แล้ว', Colors.green);
     } catch (e) {
       _showMessage(

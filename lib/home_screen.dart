@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'wallet_screen.dart';
 import 'notifications_screen.dart';
@@ -163,7 +164,17 @@ class _HomeScreenState extends State<HomeScreen>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   static const String _shopOperationsCollection = 'shop_operations';
   static const String _notificationTargetApp = 'van1';
+  static const String _shopCollectionKeyPrefix = 'merchant_shop_collection_';
   static const Duration _firestoreReadTimeout = Duration(seconds: 8);
+  static const Duration _firestoreCacheTimeout = Duration(seconds: 2);
+  static const Duration _firestoreServerTimeout = Duration(seconds: 3);
+  static const List<String> _registrationFallbackCollections = <String>[
+    'shop_registrations',
+    'market_registrations',
+    'restaurant_registrations',
+    'pharmacy_registrations',
+    'other_registrations',
+  ];
 
   int _notificationCount = 0;
   String? _activeNotification;
@@ -209,6 +220,8 @@ class _HomeScreenState extends State<HomeScreen>
     WidgetsBinding.instance.addObserver(this);
     _tabController = TabController(length: _tabCount, vsync: this);
     _pages[0] = _buildPage(0);
+    // Mount the order listener with Home so the tab is warm before first tap.
+    _pages[2] = const OrderManagementScreen();
     _tabController.addListener(_handleTabChange);
     _loadShopDetails();
     _startChatWarmup();
@@ -297,6 +310,7 @@ class _HomeScreenState extends State<HomeScreen>
       _hydrateCachedProducts(user.uid);
       _hydrateCachedShopProfile(user.uid);
       unawaited(_ensureShopOperationsDoc(user.uid));
+      unawaited(prefetchShopOrdersCache(user.uid));
 
       final collectionsToCheck = await _collectionsToCheck(user);
       if (collectionsToCheck.isEmpty) return;
@@ -304,55 +318,23 @@ class _HomeScreenState extends State<HomeScreen>
       DocumentReference<Map<String, dynamic>>? foundDocRef;
       DocumentSnapshot<Map<String, dynamic>>? foundSnapshot;
 
-      if (collectionsToCheck.length == 1) {
-        final collectionName = collectionsToCheck.first;
-        foundDocRef = FirebaseFirestore.instance
-            .collection(collectionName)
-            .doc(user.uid);
-        try {
-          foundSnapshot = await foundDocRef.get().timeout(
-            _firestoreReadTimeout,
-          );
-          if (!foundSnapshot.exists) {
-            foundSnapshot = null;
-          }
-        } catch (error) {
-          debugPrint('Shop doc read failed ($collectionName): $error');
-        }
-      } else {
-        final results = await Future.wait(
-          collectionsToCheck.map((collectionName) async {
-            final docRef = FirebaseFirestore.instance
-                .collection(collectionName)
-                .doc(user.uid);
-            try {
-              final snapshot = await docRef.get().timeout(
-                _firestoreReadTimeout,
-              );
-              if (snapshot.exists) {
-                return (docRef, snapshot);
-              }
-            } catch (error) {
-              debugPrint('Shop doc read failed ($collectionName): $error');
-            }
-            return null;
-          }),
+      for (final collectionName in collectionsToCheck) {
+        final snapshot = await _readRegistrationDoc(
+          collectionName,
+          user.uid,
+          logOnFailure: collectionsToCheck.length == 1,
         );
-        final firstHit = results
-            .whereType<
-              (
-                DocumentReference<Map<String, dynamic>>,
-                DocumentSnapshot<Map<String, dynamic>>,
-              )
-            >()
-            .firstOrNull;
-        if (firstHit != null) {
-          foundDocRef = firstHit.$1;
-          foundSnapshot = firstHit.$2;
-        }
+        if (snapshot == null) continue;
+        foundDocRef = snapshot.reference;
+        foundSnapshot = snapshot;
+        unawaited(_rememberShopCollection(user.uid, collectionName));
+        break;
       }
 
-      if (foundSnapshot == null || !foundSnapshot.exists) return;
+      if (foundSnapshot == null || !foundSnapshot.exists) {
+        unawaited(_probeOtherRegistrationCollections(user.uid));
+        return;
+      }
       final data = foundSnapshot.data();
       if (data == null) return;
 
@@ -377,7 +359,10 @@ class _HomeScreenState extends State<HomeScreen>
         _homeProductIds = homeIds;
         _pages[0] = _buildPage(0);
       });
-      unawaited(ShopProfileCacheService.instance.saveProfile(user.uid, data));
+      unawaited(ShopProfileCacheService.instance.saveProfile(user.uid, {
+        ...data,
+        'registrationCollection': foundDocRef?.parent.id ?? '',
+      }));
       unawaited(_syncShopOperationsStatus(user.uid, isOpen));
       _updateHomeProductsCache();
 
@@ -538,8 +523,15 @@ class _HomeScreenState extends State<HomeScreen>
         .whereType<String>()
         .toSet();
     final isOpen = cached['isOpen'] as bool? ?? true;
+    final registrationCollection =
+        (cached['registrationCollection'] as String?)?.trim();
 
     setState(() {
+      if (registrationCollection != null && registrationCollection.isNotEmpty) {
+        _shopDocRef = FirebaseFirestore.instance
+            .collection(registrationCollection)
+            .doc(userId);
+      }
       if (imageUrl != null && imageUrl.isNotEmpty) {
         _shopImageUrl = imageUrl;
       }
@@ -676,27 +668,118 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<List<String>> _collectionsToCheck(User user) async {
+    final knownCollection = await _loadKnownShopCollection(user.uid);
+    if (knownCollection != null) {
+      return <String>[knownCollection];
+    }
+
     try {
       final contractDoc = await FirebaseFirestore.instance
           .collection('contracts')
           .doc(user.uid)
-          .get()
-          .timeout(_firestoreReadTimeout);
-      final String? serviceType = contractDoc.data()?['serviceType'] as String?;
+          .get(const GetOptions(source: Source.cache))
+          .timeout(_firestoreCacheTimeout);
+      final serviceType = contractDoc.data()?['serviceType'] as String?;
       if (serviceType != null && serviceType.trim().isNotEmpty) {
         return <String>[_collectionForServiceType(serviceType)];
       }
-    } catch (e) {
-      debugPrint('Failed to read service type: $e');
+    } catch (_) {}
+
+    try {
+      final contractDoc = await FirebaseFirestore.instance
+          .collection('contracts')
+          .doc(user.uid)
+          .get(const GetOptions(source: Source.server))
+          .timeout(_firestoreServerTimeout);
+      final serviceType = contractDoc.data()?['serviceType'] as String?;
+      if (serviceType != null && serviceType.trim().isNotEmpty) {
+        return <String>[_collectionForServiceType(serviceType)];
+      }
+    } catch (error) {
+      if (error is! TimeoutException) {
+        debugPrint('Failed to read service type: $error');
+      }
     }
 
-    return const <String>[
-      'shop_registrations',
-      'market_registrations',
-      'restaurant_registrations',
-      'pharmacy_registrations',
-      'other_registrations',
-    ];
+    return const <String>['shop_registrations'];
+  }
+
+  Future<void> _probeOtherRegistrationCollections(String userId) async {
+    for (final collectionName in _registrationFallbackCollections) {
+      if (collectionName == 'shop_registrations') continue;
+      final snapshot = await _readRegistrationDoc(
+        collectionName,
+        userId,
+        logOnFailure: false,
+      );
+      if (snapshot == null) continue;
+      await _rememberShopCollection(userId, collectionName);
+      if (!mounted) return;
+      if (_shopDocRef == null) {
+        setState(() => _shopDocRef = snapshot.reference);
+      }
+      return;
+    }
+  }
+
+  Future<String?> _loadKnownShopCollection(String userId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('$_shopCollectionKeyPrefix$userId')?.trim();
+    if (saved != null && saved.isNotEmpty) {
+      return saved;
+    }
+
+    final pendingServiceType =
+        prefs.getString('pending_reg_service_type')?.trim();
+    if (pendingServiceType != null && pendingServiceType.isNotEmpty) {
+      return _collectionForServiceType(pendingServiceType);
+    }
+
+    final cached = await ShopProfileCacheService.instance.loadProfile(userId);
+    final cachedCollection =
+        (cached?['registrationCollection'] as String?)?.trim();
+    if (cachedCollection != null && cachedCollection.isNotEmpty) {
+      return cachedCollection;
+    }
+    return null;
+  }
+
+  Future<void> _rememberShopCollection(String userId, String collection) async {
+    if (userId.isEmpty || collection.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('$_shopCollectionKeyPrefix$userId', collection);
+  }
+
+  Future<DocumentSnapshot<Map<String, dynamic>>?> _readRegistrationDoc(
+    String collectionName,
+    String userId, {
+    required bool logOnFailure,
+  }) async {
+    final docRef = FirebaseFirestore.instance
+        .collection(collectionName)
+        .doc(userId);
+    try {
+      final cached = await docRef
+          .get(const GetOptions(source: Source.cache))
+          .timeout(_firestoreCacheTimeout);
+      if (cached.exists) {
+        return cached;
+      }
+    } catch (_) {}
+
+    try {
+      final snapshot = await docRef
+          .get(const GetOptions(source: Source.server))
+          .timeout(_firestoreServerTimeout);
+      if (snapshot.exists) {
+        return snapshot;
+      }
+    } catch (error) {
+      if (logOnFailure) {
+        debugPrint('Shop doc read failed ($collectionName): $error');
+      }
+    }
+    return null;
   }
 
   String _collectionForServiceType(String serviceType) {
@@ -861,15 +944,15 @@ class _HomeScreenState extends State<HomeScreen>
 
     final collections = await _collectionsToCheck(user);
     for (final name in collections) {
-      final docRef = FirebaseFirestore.instance.collection(name).doc(user.uid);
-      try {
-        final snapshot = await docRef.get().timeout(_firestoreReadTimeout);
-        if (snapshot.exists) {
-          _shopDocRef = docRef;
-          return _shopDocRef;
-        }
-      } catch (error) {
-        debugPrint('Shop doc lookup failed ($name): $error');
+      final snapshot = await _readRegistrationDoc(
+        name,
+        user.uid,
+        logOnFailure: collections.length == 1,
+      );
+      if (snapshot != null) {
+        _shopDocRef = snapshot.reference;
+        unawaited(_rememberShopCollection(user.uid, name));
+        return _shopDocRef;
       }
     }
     return null;

@@ -110,21 +110,25 @@ class MerchantWalletService {
     return MerchantWalletSnapshot.fromMap(doc.data() ?? const <String, dynamic>{});
   }
 
-  Stream<MerchantWalletSnapshot> watchSnapshot(String uid) async* {
+  Future<MerchantWalletSnapshot> readFirestoreSnapshot(String uid) async {
+    return _loadSnapshotFromFirestore(uid.trim());
+  }
+
+  Stream<MerchantWalletSnapshot> watchFirestoreSnapshot(String uid) async* {
     final trimmedUid = uid.trim();
     if (trimmedUid.isEmpty) {
       yield MerchantWalletSnapshot.empty;
       return;
     }
 
-    yield await loadSnapshot(trimmedUid);
+    yield await readFirestoreSnapshot(trimmedUid);
 
     await for (final snapshot in FirebaseFirestore.instance
         .collection(_walletCollection)
         .doc(trimmedUid)
         .snapshots()) {
       if (!snapshot.exists) {
-        yield await loadSnapshot(trimmedUid);
+        yield MerchantWalletSnapshot.empty;
         continue;
       }
       yield MerchantWalletSnapshot.fromMap(

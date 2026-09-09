@@ -6,11 +6,11 @@ import 'dart:async';
 import 'navigation_helper.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'services/notification_service.dart';
-import 'services/security_pin_service.dart';
-import 'services/app_unlock_session.dart';
 import 'utils/app_colors.dart';
 import 'utils/phone_auth_errors.dart';
+import 'utils/phone_auth_config.dart';
 import 'utils/phone_login_helper.dart';
+import 'utils/platform_runtime.dart';
 
 class PhoneAuthScreen extends StatefulWidget {
   const PhoneAuthScreen({super.key});
@@ -31,7 +31,6 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
   ConfirmationResult? _webConfirmationResult;
 
   String? _passwordForRegistration;
-  String? _securityPinForRegistration;
   String? _serviceTypeForRegistration;
   Map<String, dynamic>? _branchAssignmentForRegistration;
 
@@ -47,7 +46,6 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
     if (args is Map) {
       phoneNumber = args['phone'] as String?;
       _passwordForRegistration = args['password'] as String?;
-      _securityPinForRegistration = args['securityPin'] as String?;
       _serviceTypeForRegistration = args['serviceType'] as String?;
       final branchAssignment = args['branchAssignment'];
       if (branchAssignment is Map) {
@@ -118,6 +116,9 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
         _markOtpSent(phoneNumber);
         return;
       }
+      if (shouldDisablePhoneAppVerification) {
+        await _auth.setSettings(appVerificationDisabledForTesting: true);
+      }
       await _auth.verifyPhoneNumber(
         phoneNumber: phoneNumber,
         timeout: const Duration(seconds: 120),
@@ -148,9 +149,12 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
       setState(() {
         _isLoading = false;
       });
+      final message = error is FirebaseAuthException
+          ? await mapPhoneAuthError(error)
+          : 'ไม่สามารถส่ง OTP ได้ กรุณาลองใหม่อีกครั้ง';
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('ไม่สามารถส่ง OTP ได้ กรุณาลองใหม่อีกครั้ง'),
+        SnackBar(
+          content: Text(message),
           backgroundColor: Colors.red,
         ),
       );
@@ -297,14 +301,6 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
         debugPrint('Failed to sync FCM token after phone auth: $e');
       }
 
-      final pin = _securityPinForRegistration?.trim();
-      if (pin != null &&
-          SecurityPinService.instance.isValidPinFormat(pin)) {
-        await SecurityPinService.instance.setPin(firebaseUser.uid, pin);
-        AppUnlockSession.unlock();
-      }
-      _securityPinForRegistration = null;
-
       if (_serviceTypeForRegistration != null) {
         await FirebaseFirestore.instance
             .collection('contracts')
@@ -380,6 +376,25 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
               style: const TextStyle(fontSize: 16, color: Colors.grey),
             ),
             const SizedBox(height: 32),
+            if (isIosSimulator && shouldDisablePhoneAppVerification) ...[
+              Card(
+                color: Colors.orange.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    'iOS Simulator: ใช้เฉพาะเบอร์ทดสอบ\n'
+                    'Firebase Console → Authentication → Phone → '
+                    'Phone numbers for testing\n'
+                    'เช่น +66812345678 / OTP 123456',
+                    style: TextStyle(
+                      color: Colors.orange.shade900,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
             if (!_isOtpSent) ...[
               TextFormField(
                 controller: _phoneController,

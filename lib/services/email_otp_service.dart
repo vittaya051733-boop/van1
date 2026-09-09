@@ -1,4 +1,9 @@
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
+
+import '../utils/feature_flags.dart';
 
 class EmailOtpSendResult {
   const EmailOtpSendResult({
@@ -33,25 +38,44 @@ class EmailOtpService {
   FirebaseFunctions get _functions =>
       FirebaseFunctions.instanceFor(region: _region);
 
-  Future<EmailOtpSendResult> sendOtp() async {
-    final result = await _functions.httpsCallable('sendEmailOtp').call();
+  Future<EmailOtpSendResult> sendOtp({String? email}) async {
+    await _ensureAppCheckReady();
+    final resolvedEmail = _resolveEmail(email);
+    final payload = resolvedEmail == null
+        ? null
+        : <String, dynamic>{'email': resolvedEmail};
+    final result = await _functions.httpsCallable('sendEmailOtp').call(payload);
     final data = _asMap(result.data);
     return EmailOtpSendResult(
       alreadyVerified: data['alreadyVerified'] == true,
-      email: data['email'] as String?,
+      email: data['email'] as String? ?? resolvedEmail,
       expiresInSeconds: _toInt(data['expiresInSeconds']),
       resendAvailableInSeconds: _toInt(data['resendAvailableInSeconds']),
     );
   }
 
-  Future<EmailOtpVerifyResult> verifyOtp(String code) async {
+  Future<EmailOtpVerifyResult> verifyOtp(
+    String code, {
+    String? email,
+  }) async {
+    await _ensureAppCheckReady();
     final normalizedCode = code.trim();
-    final result = await _functions.httpsCallable('verifyEmailOtp').call(
-      <String, dynamic>{'otp': normalizedCode},
-    );
+    final payload = <String, dynamic>{'otp': normalizedCode};
+    final resolvedEmail = _resolveEmail(email);
+    if (resolvedEmail != null) {
+      payload['email'] = resolvedEmail;
+    }
+
+    final result = await _functions.httpsCallable('verifyEmailOtp').call(payload);
     final data = _asMap(result.data);
+    final verified = data['verified'] == true || data['success'] == true;
+    final customToken = data['customToken'] as String?;
+    if (verified && customToken != null && customToken.isNotEmpty) {
+      await FirebaseAuth.instance.signInWithCustomToken(customToken);
+    }
+
     return EmailOtpVerifyResult(
-      verified: data['verified'] == true || data['success'] == true,
+      verified: verified,
       alreadyVerified: data['alreadyVerified'] == true,
     );
   }
@@ -65,8 +89,16 @@ class EmailOtpService {
       switch (error.code) {
         case 'unauthenticated':
           return 'กรุณาเข้าสู่ระบบใหม่แล้วลองอีกครั้ง';
+        case 'permission-denied':
+          return message ?? 'ไม่มีสิทธิ์ส่ง OTP ไปยังอีเมลนี้';
+        case 'unavailable':
+        case 'internal':
+          return message ??
+              'ระบบส่ง OTP อีเมลไม่พร้อม (SMTP/functions) — ลองใหม่ภายหลัง '
+              'หรือใช้ Google/Apple สมัคร';
         case 'invalid-argument':
-          return message ?? 'รหัส OTP ไม่ถูกต้อง';
+          return message ??
+              'รูปแบบอีเมลไม่ถูกต้อง — ลองออกจากระบบแล้วสมัครใหม่';
         case 'deadline-exceeded':
           return message ?? 'รหัส OTP หมดอายุ กรุณาขอรหัสใหม่';
         case 'resource-exhausted':
@@ -74,10 +106,33 @@ class EmailOtpService {
         case 'failed-precondition':
           return message ?? 'ระบบยังไม่พร้อมส่ง OTP อีเมล';
         default:
+          if (message != null &&
+              message.toLowerCase().contains('app check')) {
+            return 'App Check ยังไม่ผ่าน — ลงทะเบียน debug token iOS: '
+                '$kVan1AppCheckDebugToken';
+          }
           return message ?? fallback;
       }
     }
     return fallback;
+  }
+
+  String? _resolveEmail(String? email) {
+    final trimmed = email?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) {
+      return trimmed;
+    }
+    return FirebaseAuth.instance.currentUser?.email?.trim();
+  }
+
+  Future<void> _ensureAppCheckReady() async {
+    try {
+      await FirebaseAppCheck.instance
+          .getToken(true)
+          .timeout(const Duration(seconds: 8));
+    } catch (error) {
+      debugPrint('App Check before email OTP: $error');
+    }
   }
 
   Map<String, dynamic> _asMap(dynamic data) {

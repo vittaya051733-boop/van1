@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
 
 class ThaiIdCardQualityIssue {
   const ThaiIdCardQualityIssue(this.code, this.messageTh);
@@ -100,29 +101,71 @@ class ThaiIdCardScanner {
     }
 
     final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    final tempFiles = <File>[];
     try {
+      final result = await _scanFileAtOrientations(
+        recognizer: recognizer,
+        source: file,
+        tempFiles: tempFiles,
+      );
+      if (result != null) {
+        return result;
+      }
+
+      throw const ThaiIdCardScanException(
+        'ไม่พบเลขบัตรประชาชน 13 หลัก — จัดบัตรให้ตรงและชัด (แนวตั้งหรือแนวนอน)',
+      );
+    } finally {
+      await recognizer.close();
+      for (final temp in tempFiles) {
+        try {
+          if (await temp.exists()) {
+            await temp.delete();
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// ลอง OCR ทั้งแนวตั้งและแนวนอน — ML Kit อ่านเลขแนวนอนได้ดีกว่า
+  static Future<ThaiIdCardScanResult?> _scanFileAtOrientations({
+    required TextRecognizer recognizer,
+    required File source,
+    required List<File> tempFiles,
+  }) async {
+    final attempts = <File>[source];
+
+    final bytes = await source.readAsBytes();
+    final decoded = img.decodeImage(bytes);
+    if (decoded != null) {
+      for (final degrees in const [90, 270]) {
+        final rotated = img.copyRotate(decoded, angle: degrees);
+        final tempPath = p.join(
+          Directory.systemTemp.path,
+          'id_ocr_${degrees}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        );
+        final tempFile = File(tempPath);
+        await tempFile.writeAsBytes(img.encodeJpg(rotated, quality: 92));
+        tempFiles.add(tempFile);
+        attempts.add(tempFile);
+      }
+    }
+
+    var sawReadableText = false;
+    for (final attempt in attempts) {
       final recognized = await recognizer.processImage(
-        InputImage.fromFilePath(file.path),
+        InputImage.fromFilePath(attempt.path),
       );
       final rawText = recognized.text;
       if (rawText.trim().length < 8) {
-        throw const ThaiIdCardScanException(
-          'อ่านตัวเลขจากบัตรไม่ได้ — ถ่ายด้านหน้าให้ชัดและไม่สะท้อนแสง',
-        );
+        continue;
       }
+      sawReadableText = true;
 
       final nationalId = _extractNationalId(rawText);
-      if (nationalId == null) {
-        throw const ThaiIdCardScanException(
-          'ไม่พบเลขบัตรประชาชน 13 หลัก — จัดบัตรให้ตรงและชัด',
-        );
-      }
-
-      final checksumValid = validateThaiNationalIdChecksum(nationalId);
-      if (!checksumValid) {
-        throw const ThaiIdCardScanException(
-          'เลขบัตรไม่ผ่านการตรวจสอบ — ถ่ายใหม่หรือกรอกเลขด้วยมือ',
-        );
+      if (nationalId == null ||
+          !validateThaiNationalIdChecksum(nationalId)) {
+        continue;
       }
 
       return ThaiIdCardScanResult(
@@ -130,9 +173,14 @@ class ThaiIdCardScanner {
         checksumValid: true,
         ocrTextLength: rawText.length,
       );
-    } finally {
-      await recognizer.close();
     }
+
+    if (!sawReadableText) {
+      throw const ThaiIdCardScanException(
+        'อ่านตัวเลขจากบัตรไม่ได้ — ถ่ายด้านหน้าให้ชัดและไม่สะท้อนแสง',
+      );
+    }
+    return null;
   }
 
   static bool validateThaiNationalIdChecksum(String id) {

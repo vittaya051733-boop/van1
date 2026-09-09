@@ -17,10 +17,12 @@ import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:van1/utils/app_check_guard.dart';
 
-import 'services/merchant_security_deposit_service.dart';
+import 'firebase_options.dart';
 import 'services/promptpay_qr_payload.dart';
+import 'storage_helper.dart';
 
 class WalletTopUpDialog extends StatefulWidget {
   const WalletTopUpDialog({
@@ -38,20 +40,26 @@ class WalletTopUpDialog extends StatefulWidget {
   State<WalletTopUpDialog> createState() => _WalletTopUpDialogState();
 }
 
+enum _TopUpGuideStep { pending, active, done, processing }
+
 class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   static const List<double> _presets = <double>[500, 1000, 2000, 3000];
   static const double _maxTopUpAmount = 5000;
   static const String _appLogoAsset = 'assets/app_logo.png';
+  static const String _twoStepGuideDateKey = 'merchant_topup_two_step_guide_date';
 
   final TextEditingController _customAmountController = TextEditingController();
   final GlobalKey _qrBoundaryKey = GlobalKey();
 
   bool _loadingConfig = true;
   bool _isBusy = false;
+  int _verifyProgress = 0;
+  Timer? _verifyProgressTimer;
 
   String? _promptPayNationalId;
   String? _recipientDisplayName;
   double? _selectedAmount;
+  double? _confirmedAmount;
   XFile? _selectedSlipImage;
 
   @override
@@ -62,8 +70,29 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
 
   @override
   void dispose() {
+    _stopVerifyProgressTicker();
     _customAmountController.dispose();
     super.dispose();
+  }
+
+  void _updateVerifyProgress(int value) {
+    if (!mounted) return;
+    final next = value.clamp(0, 100);
+    if (next == _verifyProgress) return;
+    setState(() => _verifyProgress = next);
+  }
+
+  void _startVerifyProgressTicker({int cap = 92}) {
+    _verifyProgressTimer?.cancel();
+    _verifyProgressTimer = Timer.periodic(const Duration(milliseconds: 320), (_) {
+      if (!mounted || _verifyProgress >= cap) return;
+      _updateVerifyProgress(_verifyProgress + 1);
+    });
+  }
+
+  void _stopVerifyProgressTicker() {
+    _verifyProgressTimer?.cancel();
+    _verifyProgressTimer = null;
   }
 
   Future<void> _loadPaymentConfig() async {
@@ -103,6 +132,8 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   void _selectPreset(double amount) {
     setState(() {
       _selectedAmount = amount.clamp(0, _maxTopUpAmount);
+      _confirmedAmount = null;
+      _selectedSlipImage = null;
       _customAmountController.text = '';
     });
   }
@@ -110,6 +141,8 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   void _onCustomAmountChanged(String value) {
     final parsed = double.tryParse(value);
     setState(() {
+      _confirmedAmount = null;
+      _selectedSlipImage = null;
       if (parsed == null || parsed <= 0) {
         _selectedAmount = null;
         return;
@@ -126,7 +159,78 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
     });
   }
 
+  void _confirmAmount() {
+    final amount = _selectedAmount;
+    if (amount == null || amount <= 0 || _buildPromptPayPayload(amount) == null) {
+      _showSnack('กรุณาเลือกจำนวนเงินให้ถูกต้อง');
+      return;
+    }
+    setState(() {
+      _confirmedAmount = amount;
+      _selectedSlipImage = null;
+    });
+    unawaited(_showTwoStepGuideIfNeeded());
+  }
+
+  Future<void> _showTwoStepGuideIfNeeded() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final now = DateTime.now();
+      final today =
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      if (prefs.getString(_twoStepGuideDateKey) == today) {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('วิธีเติมเครดิต'),
+          content: const Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'เติมเครดิตมี 2 ขั้นตอน:',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              SizedBox(height: 12),
+              Text('1. สแกน QR แล้วโอนเงินตามยอด'),
+              SizedBox(height: 8),
+              Text(
+                '2. แนบสลิปยืนยันการโอน — ไม่แนบ = เติมเครดิตยังไม่สำเร็จ',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('เข้าใจแล้ว'),
+            ),
+          ],
+        ),
+      );
+
+      await prefs.setString(_twoStepGuideDateKey, today);
+    } catch (_) {
+      // ไม่บล็อก flow หลักถ้าอ่าน prefs ไม่ได้
+    }
+  }
+
+  void _resetConfirmedAmount() {
+    setState(() {
+      _confirmedAmount = null;
+      _selectedSlipImage = null;
+    });
+  }
+
   double? get _amount => _selectedAmount;
+
+  double? get _qrAmount => _confirmedAmount;
 
   String? _resolvePromptPayId(Map<String, dynamic> data) {
     const fallback = '1410400168710';
@@ -162,8 +266,16 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
     return PromptPayQrPayload.build(promptPayId: promptPayId, amount: amount);
   }
 
-  bool get _canGeneratePromptPayQr {
+  bool get _canConfirmAmount {
     final amount = _amount;
+    if (amount == null || amount <= 0) {
+      return false;
+    }
+    return _buildPromptPayPayload(amount) != null;
+  }
+
+  bool get _canGeneratePromptPayQr {
+    final amount = _qrAmount;
     if (amount == null || amount <= 0) {
       return false;
     }
@@ -280,9 +392,9 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       return;
     }
 
-    final amount = _amount;
+    final amount = _qrAmount;
     if (amount == null || amount <= 0) {
-      _showSnack('กรุณาเลือกจำนวนเงินก่อน');
+      _showSnack('กรุณายืนยันจำนวนเงินก่อน');
       return;
     }
     if (amount > _maxTopUpAmount) {
@@ -290,20 +402,34 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       return;
     }
 
-    try {
-      await AppCheckGuard.ensureFinancialReady();
-    } catch (error) {
-      _showSnack(error.toString().replaceFirst('Exception: ', ''));
-      return;
-    }
+    setState(() {
+      _isBusy = true;
+      _verifyProgress = 1;
+    });
 
-    setState(() => _isBusy = true);
+    _logTopUpVerify('เริ่มส่งสลิป amount=${amount.toStringAsFixed(2)} uid=${user.uid}');
+
     try {
+      try {
+        _logTopUpVerify('App Check: กำลังขอ token...');
+        await AppCheckGuard.ensureFinancialReady();
+        _logTopUpVerify('App Check: พร้อม');
+      } catch (error) {
+        _logTopUpVerify('App Check: ล้มเหลว — $error');
+        _showSnack(error.toString().replaceFirst('Exception: ', ''));
+        return;
+      }
+      _updateVerifyProgress(8);
+
       const source = ImageSource.gallery;
       final paymentGroupId = _newPaymentGroupId(user.uid);
       final fileName = image.name.isNotEmpty ? image.name : 'slip.jpg';
       final contentType = _guessContentType(fileName);
       final objectPath = 'shops/${user.uid}/topups/$paymentGroupId/$fileName';
+      final storageBucket = _topUpStorageBucket;
+      _logTopUpVerify(
+        'paymentGroupId=$paymentGroupId path=$objectPath bucket=$storageBucket',
+      );
 
       await _ensureTopUpSlipDocExists(
         uid: user.uid,
@@ -314,32 +440,24 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
         contentType: contentType,
         source: source,
       );
+      _updateVerifyProgress(18);
 
-      final ref = FirebaseStorage.instance.ref().child(objectPath);
+      final ref = StorageHelper.instance.ref().child(objectPath);
+      _logTopUpVerify('Storage: กำลังอัปโหลดสลิป...');
       await ref.putFile(
         File(image.path),
         SettableMetadata(contentType: contentType),
       );
+      _logTopUpVerify('Storage: อัปโหลดเสร็จ');
+      _updateVerifyProgress(42);
 
-      final webpBytes = await _tryEncodeToWebpBytes(image.path);
-      if (webpBytes != null && webpBytes.isNotEmpty) {
-        final webpPath = 'shops/${user.uid}/topups/$paymentGroupId/slip.webp';
-        final webpRef = FirebaseStorage.instance.ref().child(webpPath);
-        await webpRef.putData(
-          webpBytes,
-          SettableMetadata(contentType: 'image/webp'),
-        );
-
-        await _patchTopUpSlipDoc(
+      unawaited(
+        _uploadWebpCopyInBackground(
           uid: user.uid,
           paymentGroupId: paymentGroupId,
-          patch: <String, dynamic>{
-            'webpPath': webpPath,
-            'webpContentType': 'image/webp',
-            'webpBytes': webpBytes.length,
-          },
-        );
-      }
+          imagePath: image.path,
+        ),
+      );
 
       await _patchTopUpSlipDoc(
         uid: user.uid,
@@ -349,21 +467,32 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
           'uploadedAt': FieldValue.serverTimestamp(),
         },
       );
+      _updateVerifyProgress(50);
 
       final callable = FirebaseFunctions.instanceFor(region: 'asia-southeast1')
           .httpsCallable('verifyTopUpSlip');
 
-      final response = await callable.call(<String, dynamic>{
-        'uid': user.uid,
-        'expectedAmount': amount,
-        'storagePath': objectPath,
-        'bucket': Firebase.app().options.storageBucket,
-        'paymentGroupId': paymentGroupId,
-        'fileName': fileName,
-        'contentType': contentType,
-        'sourceApp': 'van1_merchant',
-        if (widget.isSecurityDeposit) 'purpose': 'security_deposit',
-      });
+      _startVerifyProgressTicker();
+      _logTopUpVerify('Callable: เรียก verifyTopUpSlip (region=asia-southeast1)...');
+      final startedAt = DateTime.now();
+      final response = await callable
+          .call(<String, dynamic>{
+            'uid': user.uid,
+            'expectedAmount': amount,
+            'storagePath': objectPath,
+            'bucket': storageBucket,
+            'paymentGroupId': paymentGroupId,
+            'fileName': fileName,
+            'contentType': contentType,
+            'sourceApp': 'van1_merchant',
+            if (widget.isSecurityDeposit) 'purpose': 'security_deposit',
+          })
+          .timeout(const Duration(seconds: 90));
+      _logTopUpVerify(
+        'Callable: ตอบกลับใน ${DateTime.now().difference(startedAt).inMilliseconds}ms',
+      );
+      _stopVerifyProgressTicker();
+      _updateVerifyProgress(96);
 
       final data = (response.data is Map)
           ? Map<String, dynamic>.from(response.data as Map)
@@ -371,6 +500,9 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
 
       final success = data['success'] == true;
       final message = data['message']?.toString().trim();
+      _logTopUpVerify(
+        'ผลลัพธ์ success=$success status=${data['status']} message=${message ?? '-'}',
+      );
       final verifiedAmount = (data['verifiedAmount'] is num)
           ? (data['verifiedAmount'] as num).toDouble()
           : null;
@@ -395,6 +527,8 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
           'rawResponse': data,
         },
       );
+      _updateVerifyProgress(100);
+      await Future<void>.delayed(const Duration(milliseconds: 220));
 
       if (!mounted) {
         return;
@@ -452,6 +586,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
             shouldContinueForRemaining == true) {
           setState(() {
             _selectedAmount = remainingAmount;
+            _confirmedAmount = null;
             _customAmountController.text = remainingAmount.toStringAsFixed(2);
             _selectedSlipImage = null;
           });
@@ -460,8 +595,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
         }
 
         if (widget.isSecurityDeposit) {
-          final minimum = widget.minimumAmount ??
-              MerchantSecurityDepositService.requiredAmountBaht;
+          final minimum = widget.minimumAmount ?? 0;
           final paidEnough = data['securityDepositPaid'] == true ||
               (verifiedAmount != null && verifiedAmount >= minimum);
           if (!paidEnough) {
@@ -491,14 +625,56 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
         );
       }
     } on FirebaseFunctionsException catch (error) {
+      _logTopUpVerify(
+        'Callable error code=${error.code} message=${error.message} details=${error.details}',
+      );
       _showSnack(error.message ?? 'ตรวจสลิปไม่สำเร็จ');
-    } catch (error) {
+    } on TimeoutException catch (error) {
+      _logTopUpVerify('Callable timeout — $error');
+      _showSnack('ตรวจสลิปใช้เวลานานเกินไป กรุณาลองใหม่');
+    } catch (error, stackTrace) {
+      _logTopUpVerify('Unexpected error — $error');
+      debugPrintStack(stackTrace: stackTrace, label: '[TopUpVerify]');
       _showSnack('ตรวจสลิปไม่สำเร็จ: $error');
     } finally {
+      _stopVerifyProgressTicker();
+      _logTopUpVerify('จบ flow (busy=false)');
       if (mounted) {
-        setState(() => _isBusy = false);
+        setState(() {
+          _isBusy = false;
+          _verifyProgress = 0;
+        });
       }
     }
+  }
+
+  Future<void> _uploadWebpCopyInBackground({
+    required String uid,
+    required String paymentGroupId,
+    required String imagePath,
+  }) async {
+    try {
+      final webpBytes = await _tryEncodeToWebpBytes(imagePath);
+      if (webpBytes == null || webpBytes.isEmpty) {
+        return;
+      }
+
+      final webpPath = 'shops/$uid/topups/$paymentGroupId/slip.webp';
+      await StorageHelper.instance.ref().child(webpPath).putData(
+        webpBytes,
+        SettableMetadata(contentType: 'image/webp'),
+      );
+
+      await _patchTopUpSlipDoc(
+        uid: uid,
+        paymentGroupId: paymentGroupId,
+        patch: <String, dynamic>{
+          'webpPath': webpPath,
+          'webpContentType': 'image/webp',
+          'webpBytes': webpBytes.length,
+        },
+      );
+    } catch (_) {}
   }
 
   DocumentReference<Map<String, dynamic>> _topUpSlipDocRef({
@@ -575,7 +751,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
 
   Future<Uint8List?> _tryEncodeToWebpBytes(String inputPath) async {
     try {
-      return FlutterImageCompress.compressWithFile(
+      return await FlutterImageCompress.compressWithFile(
         inputPath,
         format: CompressFormat.webp,
         quality: 92,
@@ -588,6 +764,288 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   void _showSnack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _logTopUpVerify(String message) {
+    debugPrint('[TopUpVerify] $message');
+  }
+
+  String get _topUpStorageBucket {
+    final configured = DefaultFirebaseOptions.currentPlatform.storageBucket?.trim();
+    if (configured != null && configured.isNotEmpty) {
+      return configured;
+    }
+    return Firebase.app().options.storageBucket?.trim() ?? '';
+  }
+
+  _TopUpGuideStep get _step1State {
+    if (_selectedSlipImage != null || _isBusy) {
+      return _TopUpGuideStep.done;
+    }
+    return _TopUpGuideStep.active;
+  }
+
+  _TopUpGuideStep get _step2State {
+    if (_isBusy && _verifyProgress > 0) {
+      return _TopUpGuideStep.processing;
+    }
+    if (_selectedSlipImage != null) {
+      return _TopUpGuideStep.active;
+    }
+    return _TopUpGuideStep.pending;
+  }
+
+  Widget _buildTopUpStepper() {
+    return Row(
+      children: [
+        Expanded(
+          child: _buildStepperNode(
+            number: 1,
+            label: 'สแกนจ่าย',
+            state: _step1State,
+          ),
+        ),
+        _buildStepperConnector(_step1State == _TopUpGuideStep.done),
+        Expanded(
+          child: _buildStepperNode(
+            number: 2,
+            label: 'แนบสลิป',
+            state: _step2State,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStepperConnector(bool completed) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      child: SizedBox(
+        width: 28,
+        child: Divider(
+          thickness: 2,
+          color: completed ? const Color(0xFF16A34A) : Colors.black26,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStepperNode({
+    required int number,
+    required String label,
+    required _TopUpGuideStep state,
+  }) {
+    final Color circleColor;
+    final Color textColor;
+    final Widget? centerChild;
+
+    switch (state) {
+      case _TopUpGuideStep.done:
+        circleColor = const Color(0xFF16A34A);
+        textColor = const Color(0xFF16A34A);
+        centerChild = const Icon(Icons.check, color: Colors.white, size: 16);
+      case _TopUpGuideStep.active:
+        circleColor = const Color(0xFF0E55AA);
+        textColor = const Color(0xFF0E55AA);
+        centerChild = Text(
+          '$number',
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+            fontSize: 12,
+          ),
+        );
+      case _TopUpGuideStep.processing:
+        circleColor = const Color(0xFFE95500);
+        textColor = const Color(0xFFE95500);
+        centerChild = const SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Colors.white,
+          ),
+        );
+      case _TopUpGuideStep.pending:
+        circleColor = Colors.black26;
+        textColor = Colors.black54;
+        centerChild = Text(
+          '$number',
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+            fontSize: 12,
+          ),
+        );
+    }
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 28,
+          height: 28,
+          decoration: BoxDecoration(color: circleColor, shape: BoxShape.circle),
+          alignment: Alignment.center,
+          child: centerChild,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: textColor,
+          ),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTopUpWarningBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF7ED),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFFED7AA)),
+      ),
+      child: const Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline, size: 18, color: Color(0xFFC2410C)),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'โอนแล้วต้องแนบสลิป — ไม่แนบ = เติมเครดิตยังไม่สำเร็จ',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+                color: Color(0xFF9A3412),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStep2SlipSection() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF7ED),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE95500), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'ขั้นที่ 2 · แนบสลิป (จำเป็น)',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE95500),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: const Text(
+                  'จำเป็นต้องทำ',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'หลังโอนแล้ว แนบสลิปเพื่อยืนยัน — ไม่แนบ = เติมเครดิตยังไม่สำเร็จ',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF9A3412),
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Center(child: _buildSlipPickerPanel()),
+          if (_selectedSlipImage == null && !_isBusy)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                'ยังไม่แนบสลิป — การเติมเครดิตยังไม่เสร็จ',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFFC2410C),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildVerifyProgressOverlay() {
+    if (_verifyProgress <= 0) {
+      return const SizedBox.shrink();
+    }
+
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.white.withValues(alpha: 0.9),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 76,
+                height: 76,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    CircularProgressIndicator(
+                      strokeWidth: 5,
+                      value: _verifyProgress >= 100 ? 1 : null,
+                    ),
+                    Text(
+                      '$_verifyProgress%',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'กำลังตรวจสอบสลิป...',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _verifyProgress < 50
+                    ? 'กำลังอัปโหลดสลิป'
+                    : 'กำลังตรวจสอบกับระบบ',
+                style: const TextStyle(fontSize: 12, color: Colors.black54),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _buildSlipPickerPanel() {
@@ -665,13 +1123,14 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   @override
   Widget build(BuildContext context) {
     final canGenerateQr = _canGeneratePromptPayQr;
-    final amount = _amount;
+    final canConfirmAmount = _canConfirmAmount;
+    final qrAmount = _qrAmount;
     final nationalId = _promptPayNationalId;
     final recipientName = _recipientDisplayName ?? 'วิทยา ทนหงษา';
     final maskedPromptPay = nationalId == null
         ? 'PromptPay'
         : PromptPayQrPayload.maskedDisplayLabel(nationalId);
-    final amountLabel = (amount ?? 0).toStringAsFixed(2);
+    final amountLabel = (qrAmount ?? 0).toStringAsFixed(2);
     final title = widget.isSecurityDeposit
         ? 'เติมเครดิต — ค่าประกัน'
         : 'เติมเครดิต';
@@ -682,12 +1141,15 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       title: Text(title),
       content: SizedBox(
         width: 420,
-        child: _loadingConfig
-            ? const Padding(
+        child: Stack(
+          children: [
+            if (_loadingConfig)
+              const Padding(
                 padding: EdgeInsets.symmetric(vertical: 24),
                 child: Center(child: CircularProgressIndicator()),
               )
-            : ConstrainedBox(
+            else
+              ConstrainedBox(
                 constraints: BoxConstraints(
                   maxHeight: MediaQuery.sizeOf(context).height * 0.72,
                 ),
@@ -707,7 +1169,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
                           ),
                           child: Text(
                             'ชำระค่าประกัน '
-                            '${MerchantSecurityDepositService.requiredAmountBaht.toStringAsFixed(0)} บาท '
+                            '${(widget.minimumAmount ?? widget.initialAmount ?? 0).toStringAsFixed(0)} บาท '
                             'ผ่านการเติมเครดิตและตรวจสลิปให้ผ่านก่อนเริ่มอัปโหลดสินค้า',
                             style: const TextStyle(
                               fontWeight: FontWeight.w600,
@@ -717,48 +1179,92 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
                         ),
                         const SizedBox(height: 12),
                       ],
-                      const Text('เลือกจำนวนเงิน'),
-                      Text(
-                        'สูงสุด ${_maxTopUpAmount.toStringAsFixed(0)} บาทต่อครั้ง · ส่งสลิปได้ไม่เกิน 3 ครั้งต่อวัน',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: 10),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          for (final preset in _presets)
-                            ChoiceChip(
-                              label: Text(preset.toStringAsFixed(0)),
-                              selected: amount == preset,
-                              onSelected: _isBusy
-                                  ? null
-                                  : (_) => _selectPreset(preset),
+                      if (!canGenerateQr) ...[
+                        const Text('เลือกจำนวนเงิน'),
+                        Text(
+                          'สูงสุด ${_maxTopUpAmount.toStringAsFixed(0)} บาทต่อครั้ง · ส่งสลิปได้ไม่เกิน 3 ครั้งต่อวัน',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final preset in _presets)
+                              ChoiceChip(
+                                label: Text(preset.toStringAsFixed(0)),
+                                selected: _selectedAmount == preset,
+                                onSelected: _isBusy
+                                    ? null
+                                    : (_) => _selectPreset(preset),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _customAmountController,
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
+                          enabled: !_isBusy,
+                          decoration: InputDecoration(
+                            labelText: 'กำหนดเอง',
+                            hintText:
+                                'เช่น 1500 (สูงสุด ${_maxTopUpAmount.toStringAsFixed(0)})',
+                            border: const OutlineInputBorder(),
+                          ),
+                          onChanged: _onCustomAmountChanged,
+                        ),
+                        const SizedBox(height: 14),
+                        if (canConfirmAmount)
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton(
+                              onPressed: _isBusy ? null : _confirmAmount,
+                              child: const Text('ยืนยันจำนวนเงิน'),
                             ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _customAmountController,
-                        keyboardType: const TextInputType.numberWithOptions(
-                          decimal: true,
-                        ),
-                        enabled: !_isBusy,
-                        decoration: InputDecoration(
-                          labelText: 'กำหนดเอง',
-                          hintText:
-                              'เช่น 1500 (สูงสุด ${_maxTopUpAmount.toStringAsFixed(0)})',
-                          border: const OutlineInputBorder(),
-                        ),
-                        onChanged: _onCustomAmountChanged,
-                      ),
-                      const SizedBox(height: 14),
-                      if (!canGenerateQr)
-                        const Text('กรุณาเลือกจำนวนเงินเพื่อสร้าง QR')
-                      else
+                          )
+                        else
+                          const Text('กรุณาเลือกจำนวนเงินเพื่อสร้าง QR'),
+                      ] else
                         Column(
                           mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
+                            _buildTopUpStepper(),
+                            const SizedBox(height: 10),
+                            _buildTopUpWarningBanner(),
+                            const SizedBox(height: 14),
+                            const Text(
+                              'ขั้นที่ 1 · สแกนจ่าย',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'เปิดแอปธนาคาร สแกน QR แล้วโอนตามยอดด้านล่าง',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    'ยอดโอน ${qrAmount!.toStringAsFixed(2)} บาท',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: _isBusy ? null : _resetConfirmedAmount,
+                                  child: const Text('เปลี่ยนจำนวน'),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
                             Center(
                               child: RepaintBoundary(
                                 key: _qrBoundaryKey,
@@ -807,7 +1313,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
                                               builder: (context) {
                                                 final data =
                                                     _buildPromptPayPayload(
-                                                      amount!,
+                                                      qrAmount,
                                                     );
 
                                                 if (data == null ||
@@ -878,14 +1384,23 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 10),
-                            _buildSlipPickerPanel(),
+                            const SizedBox(height: 6),
+                            Text(
+                              'สแกน QR นี้ในแอปธนาคาร แล้วโอนตามยอดที่ยืนยันไว้',
+                              style: Theme.of(context).textTheme.bodySmall,
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildStep2SlipSection(),
                           ],
                         ),
                     ],
                   ),
                 ),
               ),
+            _buildVerifyProgressOverlay(),
+          ],
+        ),
       ),
       actions: [
         TextButton(

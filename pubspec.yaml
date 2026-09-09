@@ -2,13 +2,15 @@ name: van1
 description: "Van 1 Flutter project."
 publish_to: 'none'
 
-version: 1.0.15+22
+version: 1.0.15+23
 
 environment:
   sdk: ^3.9.0
 
 dependencies:
   flutter:
+    sdk: flutter
+  flutter_localizations:
     sdk: flutter
   audioplayers: ^5.2.0
   cloud_functions: ^6.0.4
@@ -71,7 +73,8 @@ dependencies:
   speech_to_text: ^7.4.0
   image_gallery_saver_plus: 4.0.1
   esc_pos_utils_plus: ^2.0.4
-  thermal_printer_flutter: ^2.0.0+3
+  thermal_printer_flutter:
+    path: local_packages/thermal_printer_flutter
 
 dev_dependencies:
   flutter_test:
@@ -113,6 +116,7 @@ flutter_launcher_icons:
 
 dependency_overrides:
   sqflite_android: 2.4.1
+  path_provider_foundation: 2.5.1
 flutter_native_splash:
   color: "#ffffff"
   image: assets/app_logo.png
