@@ -139,6 +139,7 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   bool _isHandlingVoiceCommand = false;
   bool _voiceRestartPending = false;
   bool _voiceContinuesOnQr = false;
+  bool _voiceNavigationInProgress = false;
   bool _nativeVoiceAudioPrepared = false;
   int _voiceRecoverableErrorStreak = 0;
   DateTime? _lastVoiceStartAt;
@@ -528,7 +529,12 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _ensureVoiceKeepAlive() async {
-    if (!mounted || !_voiceSessionEnabled || _isHandlingVoiceCommand) return;
+    if (!mounted ||
+        !_voiceSessionEnabled ||
+        _isHandlingVoiceCommand ||
+        _voiceNavigationInProgress) {
+      return;
+    }
     final route = ModalRoute.of(context);
     if (route != null && !route.isCurrent && !_voiceContinuesOnQr) return;
 
@@ -674,7 +680,10 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _restartVoiceListeningIfNeeded() async {
-    if (!mounted || !_voiceSessionEnabled || _isHandlingVoiceCommand) {
+    if (!mounted ||
+        !_voiceSessionEnabled ||
+        _isHandlingVoiceCommand ||
+        _voiceNavigationInProgress) {
       _voiceRestartPending = false;
       return;
     }
@@ -720,7 +729,10 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
         onResult: (result) {
           final words = result.recognizedWords.trim();
           if (words.isEmpty) return;
-          _handleVoiceResult(words, isFinal: result.finalResult);
+          scheduleMicrotask(() {
+            if (!mounted) return;
+            unawaited(_handleVoiceResult(words, isFinal: result.finalResult));
+          });
         },
       );
       if (!mounted || !_voiceSessionEnabled) return;
@@ -856,37 +868,75 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _openOrderQr(DetailedOrder order) async {
-    if (!mounted) return;
+    if (!mounted || _voiceNavigationInProgress) return;
+
+    _voiceNavigationInProgress = true;
     _voiceContinuesOnQr = _voiceSessionEnabled;
+    setState(() {});
 
-    final navigatorFuture = Navigator.push<void>(
-      context,
-      MaterialPageRoute<void>(
-        builder: (context) => OrderQRScreen(
-          order: order,
-          voiceCommandBar: _voiceSessionEnabled
-              ? _buildVoiceCommandPanel()
-              : null,
+    _voiceRestartTimer?.cancel();
+    _voiceRestartPending = false;
+    await _stopSpeechEngine();
+    _isListening = false;
+    _publishVoicePanelDisplay();
+
+    if (!mounted) {
+      _voiceNavigationInProgress = false;
+      _voiceContinuesOnQr = false;
+      return;
+    }
+
+    // iOS crashes if speech + route transition overlap — pause mic first.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+
+    if (!mounted) {
+      _voiceNavigationInProgress = false;
+      _voiceContinuesOnQr = false;
+      return;
+    }
+
+    try {
+      final routeFuture = Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (context) => OrderQRScreen(
+            order: order,
+            voiceCommandBar: _voiceSessionEnabled
+                ? _VoiceCommandBar(
+                    displayListenable: _voicePanelDisplay,
+                    onToggle: _toggleVoiceSession,
+                  )
+                : null,
+          ),
         ),
-      ),
-    );
+      );
+      _voiceNavigationInProgress = false;
 
-    if (_voiceSessionEnabled) {
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-      if (mounted && _voiceSessionEnabled) {
-        _isHandlingVoiceCommand = false;
-        _scheduleVoiceRestart(
-          message: 'หน้า QR — พูด ย้อนกลับ เพื่อกลับหน้าออเดอร์',
-        );
+      if (_voiceSessionEnabled) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (mounted && _voiceSessionEnabled && _voiceContinuesOnQr) {
+          _isHandlingVoiceCommand = false;
+          _setVoiceFeedback(
+            message: 'หน้า QR — พูด ย้อนกลับ เพื่อกลับหน้าออเดอร์',
+          );
+          await _restartVoiceListeningIfNeeded();
+        }
+      }
+
+      await routeFuture;
+    } finally {
+      _voiceNavigationInProgress = false;
+      _voiceContinuesOnQr = false;
+      if (mounted) {
+        setState(() {});
       }
     }
 
-    await navigatorFuture;
-    _voiceContinuesOnQr = false;
-    if (!mounted) return;
-    if (_voiceSessionEnabled) {
-      _scheduleVoiceRestart(message: 'พร้อมฟังคำสั่ง');
-    }
+    if (!mounted || !_voiceSessionEnabled) return;
+
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (!mounted || !_voiceSessionEnabled) return;
+    _isHandlingVoiceCommand = false;
+    _scheduleVoiceRestart(message: 'พร้อมฟังคำสั่ง');
   }
 
   Future<void> _chatVisibleOrderRider() async {
@@ -915,37 +965,73 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Future<void> _handleVoiceBackNavigation() async {
-    if (!mounted) return;
+    if (!mounted || _voiceNavigationInProgress) return;
 
+    _voiceNavigationInProgress = true;
+    _voiceRestartTimer?.cancel();
+    _voiceRestartPending = false;
+    await _stopSpeechEngine();
+    _isListening = false;
+    _publishVoicePanelDisplay();
+
+    if (!mounted) {
+      _voiceNavigationInProgress = false;
+      return;
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+
+    if (!mounted) {
+      _voiceNavigationInProgress = false;
+      return;
+    }
+
+    var didPop = false;
     if (_voiceContinuesOnQr) {
       final rootNavigator = MyApp.navigatorKey.currentState;
       if (rootNavigator != null && rootNavigator.canPop()) {
         rootNavigator.pop();
+        didPop = true;
         _setVoiceMessage('กลับหน้าจัดการออเดอร์แล้ว');
-        return;
+      } else {
+        final navigator = Navigator.of(context);
+        if (navigator.canPop()) {
+          navigator.pop();
+          didPop = true;
+          _setVoiceMessage('กลับหน้าจัดการออเดอร์แล้ว');
+        }
       }
+    } else {
       final navigator = Navigator.of(context);
-      if (navigator.canPop()) {
-        navigator.pop();
-        _setVoiceMessage('กลับหน้าจัดการออเดอร์แล้ว');
+      if (await navigator.maybePop()) {
+        didPop = true;
+      } else {
+        final rootNavigator = Navigator.of(context, rootNavigator: true);
+        if (!identical(rootNavigator, navigator) &&
+            await rootNavigator.maybePop()) {
+          didPop = true;
+        }
       }
-      return;
+
+      if (!didPop && mounted) {
+        await Navigator.of(
+          context,
+        ).pushNamedAndRemoveUntil('/home', (route) => false);
+      }
     }
 
-    final navigator = Navigator.of(context);
-    if (await navigator.maybePop()) {
-      return;
+    _voiceContinuesOnQr = false;
+    _voiceNavigationInProgress = false;
+    if (mounted) {
+      setState(() {});
     }
 
-    final rootNavigator = Navigator.of(context, rootNavigator: true);
-    if (!identical(rootNavigator, navigator) && await rootNavigator.maybePop()) {
-      return;
-    }
+    if (!mounted || !_voiceSessionEnabled) return;
 
-    if (!mounted) return;
-    await Navigator.of(
-      context,
-    ).pushNamedAndRemoveUntil('/home', (route) => false);
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (!mounted || !_voiceSessionEnabled) return;
+    _isHandlingVoiceCommand = false;
+    _scheduleVoiceRestart(message: 'พร้อมฟังคำสั่ง');
   }
 
   Future<void> _callVisibleOrderRider() async {
@@ -1233,7 +1319,10 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
       debugPrint('Voice command failed: $error');
     } finally {
       _isHandlingVoiceCommand = false;
-      if (mounted && _voiceSessionEnabled) {
+      if (mounted &&
+          _voiceSessionEnabled &&
+          !_voiceNavigationInProgress &&
+          !_voiceContinuesOnQr) {
         _scheduleVoiceRestart(
           message: 'ทำคำสั่งแล้ว กำลังฟังต่อ...',
           delay: const Duration(milliseconds: 550),
@@ -1243,75 +1332,9 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
   }
 
   Widget _buildVoiceCommandPanel() {
-    return SafeArea(
-      top: false,
-      child: ValueListenableBuilder<_VoicePanelDisplay>(
-        valueListenable: _voicePanelDisplay,
-        builder: (context, display, _) {
-          return Container(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-            decoration: const BoxDecoration(
-              color: Colors.white,
-              border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
-            ),
-            child: Row(
-              children: [
-                IconButton.filledTonal(
-                  onPressed: _toggleVoiceSession,
-                  icon: Icon(
-                    display.enabled || display.listening
-                        ? Icons.mic_rounded
-                        : Icons.mic_none_rounded,
-                  ),
-                  tooltip: display.enabled
-                      ? 'หยุดฟังคำสั่งเสียง'
-                      : 'เริ่มฟังคำสั่งเสียง',
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        display.message,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        display.heardText.trim().isNotEmpty
-                            ? 'คำที่พูด: ${display.heardText.trim()}'
-                            : 'เปิดไว้ได้ตลอด พูดชื่อปุ่ม เช่น รับออเดอร์, ปฏิเสธ, แสดง QR, เลื่อนลง',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF64748B),
-                        ),
-                      ),
-                      if (display.correctionText.trim().isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          display.correctionText.trim(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: AppColors.accent,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
+    return _VoiceCommandBar(
+      displayListenable: _voicePanelDisplay,
+      onToggle: _toggleVoiceSession,
     );
   }
 
@@ -1405,7 +1428,8 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
         foregroundColor: Colors.white,
       ),
       backgroundColor: Colors.white,
-      bottomNavigationBar: _buildVoiceCommandPanel(),
+      bottomNavigationBar:
+          _voiceContinuesOnQr ? null : _buildVoiceCommandPanel(),
       body: _buildOrdersBody(),
     );
   }
@@ -2623,6 +2647,90 @@ class _VoiceCommandAction {
     }
     if (bestMatch == null || bestMatch.confidence < 0.45) return null;
     return bestMatch;
+  }
+}
+
+class _VoiceCommandBar extends StatelessWidget {
+  const _VoiceCommandBar({
+    required this.displayListenable,
+    required this.onToggle,
+  });
+
+  final ValueNotifier<_VoicePanelDisplay> displayListenable;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: ValueListenableBuilder<_VoicePanelDisplay>(
+        valueListenable: displayListenable,
+        builder: (context, display, _) {
+          return Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
+            ),
+            child: Row(
+              children: [
+                IconButton.filledTonal(
+                  onPressed: onToggle,
+                  icon: Icon(
+                    display.enabled || display.listening
+                        ? Icons.mic_rounded
+                        : Icons.mic_none_rounded,
+                  ),
+                  tooltip: display.enabled
+                      ? 'หยุดฟังคำสั่งเสียง'
+                      : 'เริ่มฟังคำสั่งเสียง',
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        display.message,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        display.heardText.trim().isNotEmpty
+                            ? 'คำที่พูด: ${display.heardText.trim()}'
+                            : 'เปิดไว้ได้ตลอด พูดชื่อปุ่ม เช่น รับออเดอร์, ปฏิเสธ, แสดง QR, เลื่อนลง',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF64748B),
+                        ),
+                      ),
+                      if (display.correctionText.trim().isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          display.correctionText.trim(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: AppColors.accent,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
   }
 }
 
