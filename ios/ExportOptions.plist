@@ -7,12 +7,17 @@
 	<key>teamID</key>
 	<string>8ZRFLUPF7H</string>
 	<key>signingStyle</key>
-	<string>automatic</string>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string>Apple Distribution</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.vantalad.merchant</key>
+		<string>vantalad_merchant_profile</string>
+	</dict>
 	<key>uploadSymbols</key>
 	<true/>
 	<key>compileBitcode</key>
 	<false/>
-	<key>destination</key>
-	<string>export</string>
 </dict>
 </plist>

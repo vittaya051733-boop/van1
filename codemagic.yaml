@@ -36,8 +36,26 @@ workflows:
           echo "Building $(grep '^version:' pubspec.yaml)"
       - name: Build IPA
         script: |
-          flutter build ipa --release \
-            --export-options-plist=ios/ExportOptions.plist
+          set -euo pipefail
+          EXPORT_PLIST="/Users/builder/export_options.plist"
+          if [ ! -f "$EXPORT_PLIST" ]; then
+            echo "Codemagic export_options.plist not found — using repo fallback"
+            EXPORT_PLIST="ios/ExportOptions.plist"
+          fi
+          echo "Using export plist: $EXPORT_PLIST"
+          flutter build ipa --release --export-options-plist="$EXPORT_PLIST"
+      - name: Verify IPA output
+        script: |
+          set -euo pipefail
+          echo "Searching for IPA artifacts..."
+          find build -name "*.ipa" -print -ls
+          shopt -s nullglob
+          ipas=(build/ios/ipa/*.ipa)
+          if [ ${#ipas[@]} -eq 0 ]; then
+            echo "ERROR: flutter build ipa finished but no .ipa file was produced."
+            exit 1
+          fi
+          echo "IPA ready: ${ipas[*]}"
     artifacts:
       - build/ios/ipa/*.ipa
     publishing:
