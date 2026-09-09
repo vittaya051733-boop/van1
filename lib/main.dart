@@ -310,7 +310,7 @@ class AuthWrapper extends StatefulWidget {
 }
 
 class _AuthWrapperState extends State<AuthWrapper> {
-  static const Duration _navigationTimeout = Duration(seconds: 8);
+  static const Duration _navigationTimeout = Duration(seconds: 12);
   bool _showRetry = false;
 
   @override
@@ -351,6 +351,7 @@ class _AuthWrapperState extends State<AuthWrapper> {
     } on TimeoutException {
       debugPrint('Auth navigation timed out after $_navigationTimeout');
       if (!mounted) return;
+      // HomeScreen จะ hydrate cache + retry โปรไฟล์ร้านเอง
       Navigator.of(context).pushReplacementNamed('/home');
     } catch (e, stackTrace) {
       debugPrint('Auth navigation failed: $e\n$stackTrace');

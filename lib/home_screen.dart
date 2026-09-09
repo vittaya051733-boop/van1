@@ -167,7 +167,7 @@ class _HomeScreenState extends State<HomeScreen>
   static const String _shopCollectionKeyPrefix = 'merchant_shop_collection_';
   static const Duration _firestoreReadTimeout = Duration(seconds: 8);
   static const Duration _firestoreCacheTimeout = Duration(seconds: 2);
-  static const Duration _firestoreServerTimeout = Duration(seconds: 3);
+  static const Duration _firestoreServerTimeout = Duration(seconds: 8);
   static const List<String> _registrationFallbackCollections = <String>[
     'shop_registrations',
     'market_registrations',
@@ -202,6 +202,8 @@ class _HomeScreenState extends State<HomeScreen>
   DocumentReference<Map<String, dynamic>>? _shopDocRef;
   String? _currentUserId;
   int _unreadChatCount = 0;
+  Timer? _shopProfileRetryTimer;
+  int _shopProfileRetryAttempt = 0;
 
   void showOverlayNotification(String message) {
     setState(() {
@@ -307,15 +309,17 @@ class _HomeScreenState extends State<HomeScreen>
       if (user == null) return;
 
       _currentUserId = user.uid;
-      _hydrateCachedProducts(user.uid);
-      _hydrateCachedShopProfile(user.uid);
+      unawaited(_hydrateCachedProducts(user.uid));
+      await _hydrateCachedShopProfile(user.uid);
       unawaited(_ensureShopOperationsDoc(user.uid));
       unawaited(prefetchShopOrdersCache(user.uid));
 
       final collectionsToCheck = await _collectionsToCheck(user);
-      if (collectionsToCheck.isEmpty) return;
+      if (collectionsToCheck.isEmpty) {
+        _scheduleShopProfileRetry(user.uid);
+        return;
+      }
 
-      DocumentReference<Map<String, dynamic>>? foundDocRef;
       DocumentSnapshot<Map<String, dynamic>>? foundSnapshot;
 
       for (final collectionName in collectionsToCheck) {
@@ -325,57 +329,91 @@ class _HomeScreenState extends State<HomeScreen>
           logOnFailure: collectionsToCheck.length == 1,
         );
         if (snapshot == null) continue;
-        foundDocRef = snapshot.reference;
         foundSnapshot = snapshot;
         unawaited(_rememberShopCollection(user.uid, collectionName));
         break;
       }
 
       if (foundSnapshot == null || !foundSnapshot.exists) {
-        unawaited(_probeOtherRegistrationCollections(user.uid));
+        await _probeOtherRegistrationCollections(user.uid);
+        _scheduleShopProfileRetry(user.uid);
         return;
       }
-      final data = foundSnapshot.data();
-      if (data == null) return;
 
-      final String? imageUrl = ShopProfileResolver.resolveImageUrl(data);
-      final String? name = ShopProfileResolver.resolveName(data);
-      final bool isOpen = data['isOpen'] as bool? ?? true;
-      final Set<String> homeIds =
-          ((data['homeProductIds'] as List?) ?? const [])
-              .whereType<String>()
-              .toSet();
-
-      if (!mounted) return;
-      setState(() {
-        _shopDocRef = foundDocRef;
-        if (imageUrl != null && imageUrl.isNotEmpty) {
-          _shopImageUrl = imageUrl;
-        }
-        if (name != null && name.isNotEmpty) {
-          _shopName = name;
-        }
-        _isShopOpen = isOpen;
-        _homeProductIds = homeIds;
-        _pages[0] = _buildPage(0);
-      });
-      unawaited(ShopProfileCacheService.instance.saveProfile(user.uid, {
-        ...data,
-        'registrationCollection': foundDocRef?.parent.id ?? '',
-      }));
-      unawaited(_syncShopOperationsStatus(user.uid, isOpen));
-      _updateHomeProductsCache();
-
-      if (imageUrl != null && imageUrl.isNotEmpty) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            precacheImage(NetworkImage(imageUrl), context);
-          }
-        });
-      }
+      await _applyShopProfileSnapshot(
+        userId: user.uid,
+        snapshot: foundSnapshot,
+      );
+      _shopProfileRetryTimer?.cancel();
+      _shopProfileRetryAttempt = 0;
     } catch (e) {
       debugPrint('Failed to load shop details: $e');
+      final uid = _currentUserId ?? FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        _scheduleShopProfileRetry(uid);
+      }
     }
+  }
+
+  Future<void> _applyShopProfileSnapshot({
+    required String userId,
+    required DocumentSnapshot<Map<String, dynamic>> snapshot,
+  }) async {
+    final data = snapshot.data();
+    if (data == null || !mounted) return;
+
+    final String? imageUrl = ShopProfileResolver.resolveImageUrl(data);
+    final String? name = ShopProfileResolver.resolveName(data);
+    final bool isOpen = data['isOpen'] as bool? ?? true;
+    final Set<String> homeIds =
+        ((data['homeProductIds'] as List?) ?? const []).whereType<String>().toSet();
+
+    setState(() {
+      _shopDocRef = snapshot.reference;
+      if (imageUrl != null && imageUrl.isNotEmpty) {
+        _shopImageUrl = imageUrl;
+      }
+      if (name != null && name.isNotEmpty) {
+        _shopName = name;
+      }
+      _isShopOpen = isOpen;
+      _homeProductIds = homeIds;
+      _pages[0] = _buildPage(0);
+    });
+    unawaited(ShopProfileCacheService.instance.saveProfile(userId, {
+      ...data,
+      'registrationCollection': snapshot.reference.parent.id,
+    }));
+    unawaited(_syncShopOperationsStatus(userId, isOpen));
+    _updateHomeProductsCache();
+
+    if (imageUrl != null && imageUrl.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          precacheImage(NetworkImage(imageUrl), context);
+        }
+      });
+    }
+  }
+
+  bool get _shopProfileLooksIncomplete {
+    final hasName = _shopName != null && _shopName!.trim().isNotEmpty;
+    final hasImage = _shopImageUrl != null && _shopImageUrl!.trim().isNotEmpty;
+    return !hasName || !hasImage;
+  }
+
+  void _scheduleShopProfileRetry(String userId) {
+    if (!_shopProfileLooksIncomplete) return;
+
+    _shopProfileRetryTimer?.cancel();
+    if (_shopProfileRetryAttempt >= 4) return;
+
+    final delaySeconds = 2 + (_shopProfileRetryAttempt * 2);
+    _shopProfileRetryAttempt++;
+    _shopProfileRetryTimer = Timer(Duration(seconds: delaySeconds), () {
+      if (!mounted || !_shopProfileLooksIncomplete) return;
+      unawaited(_loadShopDetails());
+    });
   }
 
   void _startChatWarmup() {
@@ -712,12 +750,9 @@ class _HomeScreenState extends State<HomeScreen>
         userId,
         logOnFailure: false,
       );
-      if (snapshot == null) continue;
+      if (snapshot == null || !snapshot.exists) continue;
       await _rememberShopCollection(userId, collectionName);
-      if (!mounted) return;
-      if (_shopDocRef == null) {
-        setState(() => _shopDocRef = snapshot.reference);
-      }
+      await _applyShopProfileSnapshot(userId: userId, snapshot: snapshot);
       return;
     }
   }
@@ -981,6 +1016,7 @@ class _HomeScreenState extends State<HomeScreen>
     _shopOperationsSubscription?.cancel();
     _tabController.removeListener(_handleTabChange);
     _tabController.dispose();
+    _shopProfileRetryTimer?.cancel();
     super.dispose();
   }
 
