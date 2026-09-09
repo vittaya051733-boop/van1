@@ -31,10 +31,13 @@ workflows:
           cd ios
           pod install
           cd ..
+      - name: Verify app version
+        script: |
+          echo "Building $(grep '^version:' pubspec.yaml)"
       - name: Build IPA
         script: |
           flutter build ipa --release \
-            --export-options-plist=/Users/builder/export_options.plist
+            --export-options-plist=ios/ExportOptions.plist
     artifacts:
       - build/ios/ipa/*.ipa
     publishing:
