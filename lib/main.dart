@@ -84,7 +84,7 @@ void main() {
                   : const AndroidPlayIntegrityProvider(),
               providerApple: useDebugAppCheck
                   ? AppleDebugProvider(debugToken: kVan1AppCheckDebugToken)
-                  : const AppleDeviceCheckProvider(),
+                  : const AppleAppAttestWithDeviceCheckFallbackProvider(),
             )
             .timeout(const Duration(seconds: 5)); // กันค้าง
         await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);

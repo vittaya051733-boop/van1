@@ -16,6 +16,30 @@
 
 > หากต้องการปิด App Check ชั่วคราว ให้ไปที่ App Check → Enforcement แล้วสลับเป็น “Off” สำหรับแอปนั้น ๆ (ไม่แนะนำใน production).
 
+## ขั้นตอนสำหรับ iOS Release (TestFlight / App Store)
+
+แอป van1 merchant iOS: `com.vantalad.merchant` · Firebase app `1:802503541368:ios:60fa52f30ee44789f6a38d`
+
+1. **โค้ด (ทำแล้วใน repo)**  
+   - Release ใช้ `AppleAppAttestWithDeviceCheckFallbackProvider`  
+   - `ios/Runner/Runner.entitlements` มี `com.apple.developer.devicecheck.appattest-environment = production`
+
+2. **Apple Developer**  
+   - App ID `com.vantalad.merchant` → เปิด capability **App Attest** (Xcode automatic signing มัก sync ให้เมื่อ build)
+
+3. **Firebase Console → Build → App Check → แอป iOS (van.merchant / com.vantalad.merchant)**  
+   - ลงทะเบียน **App Attest**  
+   - ลงทะเบียน **DeviceCheck** (fallback — SDK ใช้คู่กัน)  
+   - Debug build: ลง **Debug token** เดียวกับ Android (`kVan1AppCheckDebugToken`)
+
+4. **Enforcement**  
+   - Cloud Functions ที่เกี่ยวกับ wallet (`verifyTopUpSlip`, `getWithdrawableBalance`, `requestManualWithdraw`, `getMerchantWallet`) ใช้ `enforceAppCheck: true` อยู่แล้ว  
+   - ตรวจว่า App Check enforcement สำหรับ **Cloud Functions** ไม่ใช่ Off
+
+5. **Build ใหม่** แล้วติดตั้ง TestFlight — attestation ผูกกับ bundle + team + build จ distribution
+
+> TestFlight ใช้ App Attest **production** ไม่ใช้ debug token
+
 ## ขั้นตอนสำหรับ Release (Play Integrity)
 
 1. ใน Firebase Console → App Check → เลือกแอป Android → เปิดใช้งาน **Play Integrity**.
@@ -65,6 +89,7 @@ App attestation failed (403)
 
 ## สรุป
 
-- Dev/QA → ใช้ Debug provider + ลง token **ครั้งเดียว** (รหัส pin ในโค้ด)
-- Production → ใช้ Play Integrity และเพิ่ม SHA ทุกตัว (debug, release, CI)
+- Dev/QA → ใช้ Debug provider + ลง token **ครั้งเดียว** (รหัส pin ในโค้ด) — Android + iOS
+- Android production → Play Integrity + SHA ทุกตัว (debug, release, CI)
+- iOS production → App Attest (+ DeviceCheck fallback) + entitlements + ลงทะเบียน provider ใน Firebase Console
 - ไม่ต้องอัปเดต token ทุกครั้งที่รัน — เปลี่ยนเมื่อ rotate keystore หรือเปลี่ยน `--dart-define=VAN1_APP_CHECK_DEBUG_TOKEN`

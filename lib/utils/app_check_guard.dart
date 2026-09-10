@@ -6,10 +6,22 @@ import 'package:van1/utils/feature_flags.dart';
 class AppCheckGuard {
   const AppCheckGuard._();
 
+  static String get _financialReleaseMessage {
+    if (kIsWeb) {
+      return 'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณารีเฟรชหน้าแล้วลองใหม่';
+    }
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return 'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณาอัปเดตแอปจาก TestFlight หรือ App Store แล้วลองใหม่';
+    }
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return 'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณาอัปเดตแอปจาก Play Store แล้วลองใหม่';
+    }
+    return 'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณาอัปเดตแอปแล้วลองใหม่';
+  }
+
   static Future<void> ensureFinancialReady() async {
     await _ensureToken(
-      releaseMessage:
-          'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณาอัปเดตแอปจาก Play Store แล้วลองใหม่',
+      releaseMessage: _financialReleaseMessage,
       requiredInDebug: true,
     );
   }
