@@ -19,19 +19,29 @@ workflows:
     scripts:
       - name: Install dependencies
         script: flutter pub get
-      - name: Fetch current App Store signing files
-        script: |
-          keychain initialize
-          app-store-connect fetch-signing-files "$BUNDLE_ID" \
-            --type IOS_APP_STORE \
-            --create
-          keychain add-certificates
-          xcode-project use-profiles
       - name: Install CocoaPods
         script: |
           cd ios
           pod install
           cd ..
+      - name: Fetch and apply current App Store signing files
+        script: |
+          set -euo pipefail
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --create
+          keychain add-certificates
+          xcode-project use-profiles \
+            --project "$CM_BUILD_DIR/ios/Runner.xcodeproj" \
+            --profile "$HOME/Library/MobileDevice/Provisioning Profiles/*.mobileprovision"
+          echo "Resolved Runner Release signing:"
+          xcodebuild \
+            -project "$CM_BUILD_DIR/ios/Runner.xcodeproj" \
+            -scheme Runner \
+            -configuration Release \
+            -showBuildSettings |
+            grep -E "CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER"
       - name: Verify app version
         script: |
           echo "Building $(grep '^version:' pubspec.yaml)"
