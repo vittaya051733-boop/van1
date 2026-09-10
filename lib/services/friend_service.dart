@@ -325,8 +325,9 @@ class FriendService {
         final data = doc.data();
         final shopOwnerId = (data['ownerId'] as String?) ?? doc.id;
         if (shopOwnerId.isEmpty) continue;
-        if (exclude.contains(shopOwnerId) || seen.contains(shopOwnerId))
+        if (exclude.contains(shopOwnerId) || seen.contains(shopOwnerId)) {
           continue;
+        }
 
         final email = (data['email'] as String?)?.toLowerCase().trim();
         if (lowerOwnerEmail != null &&
@@ -389,8 +390,9 @@ class FriendService {
       void takeCandidates({required bool sameServiceOnly}) {
         for (final profile in candidates) {
           if (suggestions.length >= limit) break;
-          if (exclude.contains(profile.uid) || seen.contains(profile.uid))
+          if (exclude.contains(profile.uid) || seen.contains(profile.uid)) {
             continue;
+          }
 
           if (sameServiceOnly) {
             if (matchingCollection == null) continue;

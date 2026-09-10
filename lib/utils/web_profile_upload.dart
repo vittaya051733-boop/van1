@@ -1,7 +1,6 @@
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
-import 'package:image_picker/image_picker.dart';
 
 Future<String?> uploadProfileImage({
   required Reference ref,
@@ -20,7 +19,7 @@ Future<String?> uploadProfileImage({
       uploadBytes.isNotEmpty ? uploadBytes : bytes,
       SettableMetadata(contentType: 'image/jpeg'),
     );
-    return snapshot.ref.getDownloadURL();
+    return await snapshot.ref.getDownloadURL();
   } catch (_) {
     return null;
   }

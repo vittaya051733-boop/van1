@@ -67,7 +67,7 @@ class BranchAssignmentService {
       if (position == null) {
         return central(source: 'location_unavailable');
       }
-      return resolveForCoordinates(
+      return await resolveForCoordinates(
         latitude: position.latitude,
         longitude: position.longitude,
       );
