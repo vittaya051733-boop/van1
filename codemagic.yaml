@@ -8,8 +8,11 @@ workflows:
     environment:
       flutter: stable
       xcode: latest
-      vars:
-        BUNDLE_ID: com.vantalad.merchant
+      ios_signing:
+        certificates:
+          - vantalad_dist
+        provisioning_profiles:
+          - vantalad_merchant_profile
     triggering:
       events:
         - push
@@ -24,24 +27,10 @@ workflows:
           cd ios
           pod install
           cd ..
-      - name: Fetch and apply current App Store signing files
+      - name: Apply stored App Store signing files
         script: |
-          set -euo pipefail
-          keychain initialize
-          app-store-connect fetch-signing-files "$BUNDLE_ID" \
-            --type IOS_APP_STORE \
-            --create
           keychain add-certificates
-          xcode-project use-profiles \
-            --project "$CM_BUILD_DIR/ios/Runner.xcodeproj" \
-            --profile "$HOME/Library/MobileDevice/Provisioning Profiles/*.mobileprovision"
-          echo "Resolved Runner Release signing:"
-          xcodebuild \
-            -project "$CM_BUILD_DIR/ios/Runner.xcodeproj" \
-            -scheme Runner \
-            -configuration Release \
-            -showBuildSettings |
-            grep -E "CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER"
+          xcode-project use-profiles
       - name: Verify app version
         script: |
           echo "Building $(grep '^version:' pubspec.yaml)"
