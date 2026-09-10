@@ -21,7 +21,11 @@ workflows:
           include: true
     scripts:
       - name: Install dependencies
-        script: flutter pub get
+        script: |
+          # pub.dev packages are public. Remove any stale CI token that causes
+          # authenticated requests to be rejected with HTTP 401/403.
+          dart pub token remove https://pub.dev || true
+          flutter pub get --enforce-lockfile
       - name: Install CocoaPods
         script: |
           cd ios
