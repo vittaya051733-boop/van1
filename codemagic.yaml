@@ -8,11 +8,8 @@ workflows:
     environment:
       flutter: stable
       xcode: latest
-      ios_signing:
-        certificates:
-          - vantalad_dist
-        provisioning_profiles:
-          - vantalad_merchant_profile
+      vars:
+        BUNDLE_ID: com.vantalad.merchant
     triggering:
       events:
         - push
@@ -22,8 +19,12 @@ workflows:
     scripts:
       - name: Install dependencies
         script: flutter pub get
-      - name: Set up Xcode signing
+      - name: Fetch current App Store signing files
         script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --create
           keychain add-certificates
           xcode-project use-profiles
       - name: Install CocoaPods
