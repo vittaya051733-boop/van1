@@ -37,7 +37,11 @@ workflows:
           xcode-project use-profiles
       - name: Verify app version
         script: |
-          echo "Building $(grep '^version:' pubspec.yaml)"
+          set -euo pipefail
+          echo "pubspec: $(grep '^version:' pubspec.yaml)"
+          BUILD_NAME="$(grep '^version:' pubspec.yaml | sed -E 's/version: ([^+]+)\+.*/\1/')"
+          BUILD_NUMBER="$(grep '^version:' pubspec.yaml | sed -E 's/version: [^+]+\+([0-9]+).*/\1/')"
+          echo "Will upload CFBundleShortVersionString=$BUILD_NAME CFBundleVersion=$BUILD_NUMBER"
       - name: Build IPA
         script: |
           set -euo pipefail
