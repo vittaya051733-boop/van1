@@ -5,6 +5,7 @@ class LegalDocument {
     required this.bodyTh,
     required this.bodyEn,
     required this.updatedAtLabel,
+    this.publicUrl,
   });
 
   final String titleTh;
@@ -12,6 +13,7 @@ class LegalDocument {
   final String bodyTh;
   final String bodyEn;
   final String updatedAtLabel;
+  final String? publicUrl;
 }
 
 class LegalContent {
@@ -20,7 +22,8 @@ class LegalContent {
   static const privacyPolicy = LegalDocument(
     titleTh: 'นโยบายความเป็นส่วนตัว',
     titleEn: 'Privacy Policy',
-    updatedAtLabel: '31 พ.ค. 2026',
+    updatedAtLabel: '12 ก.ย. 2026',
+    publicUrl: 'https://vantalad.web.app/merchant-privacy.html',
     bodyTh:
         '''แอป Van Market สำหรับร้านค้า (van1) เป็นส่วนหนึ่งของแพลตฟอร์ม VANTALAD
 
@@ -77,7 +80,8 @@ Contact
   static const termsOfService = LegalDocument(
     titleTh: 'ข้อกำหนดการใช้บริการ',
     titleEn: 'Terms of Service',
-    updatedAtLabel: '31 พ.ค. 2026',
+    updatedAtLabel: '12 ก.ย. 2026',
+    publicUrl: 'https://vantalad.web.app/merchant-terms.html',
     bodyTh: '''การใช้แอป Van Market สำหรับร้านค้า ถือว่าคุณยอมรับข้อกำหนดนี้
 
 บัญชีร้านค้า

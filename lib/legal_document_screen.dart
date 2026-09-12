@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'data/legal_content.dart';
 
@@ -23,6 +24,20 @@ class LegalDocumentScreen extends StatelessWidget {
               fontWeight: FontWeight.w600,
             ),
           ),
+          if (document.publicUrl != null) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: () {
+                  final uri = Uri.tryParse(document.publicUrl!);
+                  if (uri == null) return;
+                  launchUrl(uri, mode: LaunchMode.externalApplication);
+                },
+                child: const Text('เปิดบนเว็บ'),
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Text(
             document.bodyTh,

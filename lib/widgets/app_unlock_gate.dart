@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../services/app_unlock_session.dart';
 import '../services/biometric_auth_service.dart';
+import '../services/pending_top_up_session.dart';
 import '../services/security_pin_service.dart';
 import '../utils/app_colors.dart';
 import 'security_pin_keypad.dart';
@@ -52,6 +53,7 @@ class _AppUnlockGateState extends State<AppUnlockGate> with WidgetsBindingObserv
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden) {
+      if (PendingTopUpSession.isActive) return;
       AppUnlockSession.lock();
     }
   }
@@ -163,11 +165,14 @@ class _AppUnlockGateState extends State<AppUnlockGate> with WidgetsBindingObserv
       );
     }
 
-    if (!AppUnlockSession.isUnlocked && _hasPin) {
-      return _buildUnlockScreen();
-    }
-
-    return widget.child;
+    final locked = !AppUnlockSession.isUnlocked && _hasPin;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        IgnorePointer(ignoring: locked, child: widget.child),
+        if (locked) Positioned.fill(child: _buildUnlockScreen()),
+      ],
+    );
   }
 
   Widget _buildBrandMark() {

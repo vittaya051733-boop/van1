@@ -3978,7 +3978,29 @@ async function runGeminiProductAnalysis({
   }
 }
 
-async function notifyProductAiReady({ uid, draftId, jobId, productName }) {
+async function tryClaimFirstBulkAiReadyNotification(batchId) {
+  const ref = db.collection('bulk_product_import_batches').doc(batchId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists && snap.get('firstReadyNotifiedAt')) {
+        return false;
+      }
+      tx.set(ref, {
+        firstReadyNotifiedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return true;
+    });
+  } catch (error) {
+    logger.warn('claim first bulk AI ready notification failed', {
+      batchId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function notifyProductAiReady({ uid, draftId, jobId, productName, batchId }) {
   const notificationId = `product_ai_${jobId}`;
   const title = 'AI วิเคราะห์เสร็จแล้ว';
   const body = productName
@@ -3995,6 +4017,7 @@ async function notifyProductAiReady({ uid, draftId, jobId, productName }) {
     action: 'product_ai_ready',
     draftId,
     jobId,
+    ...(batchId ? { batchId } : {}),
     source: 'van1_product_ai',
     type: 'app_notification',
   }, { merge: true });
@@ -4013,6 +4036,7 @@ async function notifyProductAiReady({ uid, draftId, jobId, productName }) {
         notificationId: String(notificationId),
         draftId: String(draftId || ''),
         jobId: String(jobId || ''),
+        ...(batchId ? { batchId: String(batchId) } : {}),
         click_action: 'FLUTTER_NOTIFICATION_CLICK',
       },
       token: fcmToken,
@@ -4133,12 +4157,16 @@ async function processProductAiJob(jobId, jobData, apiKey) {
     }, { merge: true });
   }
 
-  await notifyProductAiReady({
-    uid,
-    draftId,
-    jobId,
-    productName: result.productName || productName,
-  });
+  const shouldNotify = !batchId || await tryClaimFirstBulkAiReadyNotification(batchId);
+  if (shouldNotify) {
+    await notifyProductAiReady({
+      uid,
+      draftId,
+      jobId,
+      productName: result.productName || productName,
+      batchId,
+    });
+  }
 
   return result;
 }

@@ -51,27 +51,8 @@
 		<true/>
 		<key>UIApplicationSupportsIndirectInputEvents</key>
 		<true/>
-		<key>FacebookAppID</key>
-		<string>4362533627406092</string>
-		<key>FacebookClientToken</key>
-		<string>fea2d2cce3e10bf12e9a24a8ef1fc55f</string>
-		<key>FacebookDisplayName</key>
-		<string>vittaya333</string>
-		<key>LSApplicationQueriesSchemes</key>
-		<array>
-			<string>fbapi</string>
-			<string>fb-messenger-share-api</string>
-			<string>fbauth2</string>
-			<string>fbshareextension</string>
-		</array>
 		<key>CFBundleURLTypes</key>
 		<array>
-			<dict>
-				<key>CFBundleURLSchemes</key>
-				<array>
-					<string>fb4362533627406092</string>
-				</array>
-			</dict>
 			<dict>
 				<key>CFBundleURLSchemes</key>
 				<array>
@@ -80,23 +61,29 @@
 			</dict>
 		</array>
 		<key>NSPhotoLibraryUsageDescription</key>
-		<string>แอปนี้ต้องการเข้าถึงคลังรูปภาพและวิดีโอของคุณเพื่อเลือกสื่อสำหรับสินค้า ร้านค้า และสมุดบัญชี</string>
+		<string>ใช้คลังรูปเพื่อเลือกภาพสินค้า เอกสารร้าน สลิปเติมเครดิต และสมุดบัญชี</string>
 		<key>NSCameraUsageDescription</key>
-		<string>แอปนี้ต้องการเข้าถึงกล้องของคุณเพื่อถ่ายรูปและวิดีโอสินค้าสำหรับร้านค้า</string>
+		<string>ใช้กล้องเพื่อถ่ายรูปสินค้า เอกสารร้าน สลิปเติมเครดิต และสแกน QR ออเดอร์</string>
 		<key>NSPhotoLibraryAddUsageDescription</key>
-		<string>แอปนี้ต้องการบันทึกไฟล์ลงในคลังรูปภาพของคุณสำหรับการดาวน์โหลดใบเสร็จและรูปสินค้า</string>
+		<string>ใช้บันทึก QR เติมเครดิต ใบเสร็จ และรูปสินค้าลงคลังรูปในเครื่อง</string>
 		<key>NSMicrophoneUsageDescription</key>
-		<string>แอปนี้ต้องการใช้ไมโครโฟนของคุณสำหรับการโทรด้วยเสียงและวิดีโอ</string>
+		<string>ใช้ไมโครโฟนเพื่อโทรกับลูกค้าหรือไรเดอร์ และใช้คำสั่งเสียงจัดการออเดอร์</string>
 		<key>NSSpeechRecognitionUsageDescription</key>
-		<string>แอปนี้ต้องการใช้การรู้จำเสียงพูดเพื่อค้นหาและจัดการออเดอร์ด้วยคำสั่งเสียง</string>
+		<string>ใช้การรู้จำเสียงพูดเพื่อรับหรือจัดการออเดอร์ด้วยคำสั่งเสียง</string>
 		<key>NSFaceIDUsageDescription</key>
-		<string>แอปนี้ใช้การยืนยันตัวตนของเครื่องเพื่อเข้าสู่ระบบอย่างปลอดภัย</string>
+		<string>ใช้ Face ID เพื่อปลดล็อกแอปและยืนยันตัวตนอย่างปลอดภัย</string>
 		<key>NSLocationWhenInUseUsageDescription</key>
-		<string>แอปนี้ต้องการตำแหน่งของคุณเพื่อระบุตำแหน่งรถและลูกค้า</string>
-		<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-		<string>ตำแหน่งแบบต่อเนื่องช่วยให้แอปรับงานและติดตามสถานะการจัดส่งได้แม้ขณะหน้าจอล็อก</string>
+		<string>ใช้ตำแหน่งขณะเปิดแอปเพื่อปักหมุดที่อยู่ร้านบนแผนที่</string>
 		<key>NSBluetoothAlwaysUsageDescription</key>
-		<string>ต้องใช้บลูทูธเพื่อเชื่อมต่อนักพิมพ์ความร้อนและอุปกรณ์เสริมอื่นๆ</string>
+		<string>ใช้บลูทูธเพื่อเชื่อมต่อเครื่องพิมพ์ใบเสร็จของร้าน</string>
+		<key>NSBluetoothPeripheralUsageDescription</key>
+		<string>ใช้บลูทูธเพื่อเชื่อมต่อเครื่องพิมพ์ใบเสร็จของร้าน</string>
+		<key>ITSAppUsesNonExemptEncryption</key>
+		<false/>
+		<key>UIBackgroundModes</key>
+		<array>
+			<string>remote-notification</string>
+		</array>
 		<key>UIStatusBarHidden</key>
 		<false/>
 	</dict>

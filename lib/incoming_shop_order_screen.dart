@@ -10,6 +10,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'chat_room_screen.dart';
 import 'models/order_model.dart';
 import 'models/user_profile.dart';
+import 'services/shop_order_credit_gate.dart';
 import 'services/shop_order_voice_commands.dart';
 import 'utils/app_colors.dart';
 import 'utils/rider_call_launcher.dart';
@@ -434,6 +435,21 @@ class _IncomingShopOrderScreenState extends State<IncomingShopOrderScreen>
     setState(() => _isSubmitting = true);
     try {
       if (accept) {
+        final decision = await ShopOrderCreditGate.ensureCanAccept(
+          context: context,
+          order: widget.order,
+        );
+        if (!mounted) return;
+        if (decision == ShopOrderCreditDecision.reject) {
+          await widget.onReject();
+          if (!mounted) return;
+          Navigator.of(context).pop(false);
+          return;
+        }
+        if (decision != ShopOrderCreditDecision.accept) {
+          setState(() => _isSubmitting = false);
+          return;
+        }
         await widget.onAccept();
       } else {
         await widget.onReject();

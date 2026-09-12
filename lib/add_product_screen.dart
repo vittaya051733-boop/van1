@@ -147,6 +147,23 @@ class _AiProductAnalysisResult {
   }
 }
 
+/// ผลลัพธ์หลังบันทึกสินค้า — ใช้ optimistic update ที่หน้าจัดการสินค้า
+class AddProductSaveResult {
+  const AddProductSaveResult({
+    this.productId,
+    this.productData,
+    this.pendingAdminReview = false,
+  });
+
+  final String? productId;
+  final Map<String, dynamic>? productData;
+  final bool pendingAdminReview;
+}
+
+class ProductSaveNavigation {
+  static VoidCallback? revealShopManagement;
+}
+
 /// แอดมิน (van4) อัปโหลดสินค้าแทนร้าน — ใช้ UI เดียวกับฝั่งร้านค้า
 class AdminProductUploadContext {
   const AdminProductUploadContext({
@@ -167,6 +184,7 @@ class AddProductScreen extends StatefulWidget {
   final String? initialLocalImagePath;
   final String? initialImageUrl;
   final Map<String, dynamic>? initialAiResult;
+  final ValueChanged<AddProductSaveResult>? onSaved;
 
   const AddProductScreen({
     super.key,
@@ -176,6 +194,7 @@ class AddProductScreen extends StatefulWidget {
     this.initialLocalImagePath,
     this.initialImageUrl,
     this.initialAiResult,
+    this.onSaved,
   });
 
   @override
@@ -4433,6 +4452,79 @@ class AddProductScreenState extends State<AddProductScreen>
     return snapshot.data() ?? const <String, dynamic>{};
   }
 
+  Map<String, dynamic> _buildLocalProductCacheData({
+    required Map<String, dynamic> productData,
+    required bool isNew,
+    required String syncStatus,
+  }) {
+    final cacheData = <String, dynamic>{};
+    productData.forEach((key, value) {
+      if (value is FieldValue) {
+        return;
+      }
+      cacheData[key] = value;
+    });
+    final now = Timestamp.now();
+    cacheData['updatedAt'] = now;
+    if (isNew) {
+      cacheData['createdAt'] = now;
+      cacheData['activeAt'] = now;
+      cacheData['isActive'] = true;
+    }
+    cacheData['localSyncStatus'] = syncStatus;
+    return cacheData;
+  }
+
+  Future<void> _persistProductLocalCache({
+    required String ownerUid,
+    required String productId,
+    required Map<String, dynamic> productData,
+    required bool isNew,
+    required String syncStatus,
+  }) async {
+    await ProductCacheService.instance.upsertProduct(
+      ownerUid,
+      CachedProduct(
+        id: productId,
+        data: _buildLocalProductCacheData(
+          productData: productData,
+          isNew: isNew,
+          syncStatus: syncStatus,
+        ),
+      ),
+    );
+  }
+
+  AddProductSaveResult _buildProductSaveResult({
+    required String productId,
+    required Map<String, dynamic> productData,
+    required bool isNew,
+    required String syncStatus,
+  }) {
+    return AddProductSaveResult(
+      productId: productId,
+      productData: _buildLocalProductCacheData(
+        productData: productData,
+        isNew: isNew,
+        syncStatus: syncStatus,
+      ),
+    );
+  }
+
+  void _completeProductSave(AddProductSaveResult result) {
+    widget.onSaved?.call(result);
+    if (!mounted) {
+      ProductSaveNavigation.revealShopManagement?.call();
+      return;
+    }
+    final navigator = Navigator.of(context);
+    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    ProductSaveNavigation.revealShopManagement?.call();
+    if (navigator.canPop()) {
+      navigator.popUntil((route) => route.isFirst);
+    }
+  }
+
   Future<void> _saveProduct() async {
     if (!_validateBasicProductFields(requirePriceStock: !_hasVariants)) {
       return;
@@ -4482,6 +4574,10 @@ class AddProductScreenState extends State<AddProductScreen>
       _uploadStatusText = 'กำลังเตรียมข้อมูล';
     });
 
+    var savedLocalProduct = false;
+    String? savedProductIdForPop;
+    Map<String, dynamic>? savedProductDataForPop;
+    var savedProductIsNew = false;
     try {
       if (_draftPersistenceEnabled) {
         // The local/remote draft is a safety net, not a prerequisite for save.
@@ -4892,9 +4988,9 @@ class AddProductScreenState extends State<AddProductScreen>
             context,
           ).showSnackBar(SnackBar(content: Text(snackMessage)));
           unawaited(_closeDraftSessionPermanently());
-          if (mounted) {
-            Navigator.pop(context, true);
-          }
+          _completeProductSave(
+            const AddProductSaveResult(pendingAdminReview: true),
+          );
         } else {
           unawaited(_closeDraftSessionPermanently());
         }
@@ -4902,19 +4998,39 @@ class AddProductScreenState extends State<AddProductScreen>
       }
 
       final productsRef = FirebaseFirestore.instance.collection('products');
-      DocumentReference<Map<String, dynamic>> docRef;
-      if (widget.productToEdit == null) {
-        productData['createdAt'] = FieldValue.serverTimestamp();
-        productData['isActive'] = true;
-        productData['activeAt'] = FieldValue.serverTimestamp();
+      final isNewProduct = widget.productToEdit == null;
+      late final DocumentReference<Map<String, dynamic>> docRef;
+      if (isNewProduct) {
         docRef = productsRef.doc();
-        await _commitSaveWrite('กำลังบันทึกสินค้า', docRef.set(productData));
       } else {
         final targetId = widget.productToEdit!.id;
         if (targetId == null || targetId.isEmpty) {
           throw Exception('ไม่สามารถระบุรหัสสินค้าที่ต้องการแก้ไขได้');
         }
         docRef = productsRef.doc(targetId);
+      }
+
+      if (mounted) {
+        setState(() => _uploadStatusText = 'กำลังบันทึกสินค้าในเครื่อง');
+      }
+      await _persistProductLocalCache(
+        ownerUid: ownerUid,
+        productId: docRef.id,
+        productData: productData,
+        isNew: isNewProduct,
+        syncStatus: 'pending',
+      );
+      savedLocalProduct = true;
+      savedProductIdForPop = docRef.id;
+      savedProductDataForPop = Map<String, dynamic>.from(productData);
+      savedProductIsNew = isNewProduct;
+
+      if (isNewProduct) {
+        productData['createdAt'] = FieldValue.serverTimestamp();
+        productData['isActive'] = true;
+        productData['activeAt'] = FieldValue.serverTimestamp();
+        await _commitSaveWrite('กำลังบันทึกสินค้า', docRef.set(productData));
+      } else {
         await _commitSaveWrite('กำลังบันทึกสินค้า', docRef.update(productData));
       }
 
@@ -4929,23 +5045,12 @@ class AddProductScreenState extends State<AddProductScreen>
             .set(specificationsData, SetOptions(merge: true)),
       );
 
-      if (mounted) {
-        setState(() => _uploadStatusText = 'กำลังอัปเดตข้อมูลในเครื่อง');
-      }
-      final cacheData = <String, dynamic>{};
-      productData.forEach((key, value) {
-        if (value is FieldValue) return;
-        cacheData[key] = value;
-      });
-      final now = Timestamp.now();
-      cacheData['updatedAt'] = now;
-      if (widget.productToEdit == null) {
-        cacheData['createdAt'] = now;
-        cacheData['activeAt'] = now;
-      }
-      await ProductCacheService.instance.upsertProduct(
-        ownerUid,
-        CachedProduct(id: docRef.id, data: cacheData),
+      await _persistProductLocalCache(
+        ownerUid: ownerUid,
+        productId: docRef.id,
+        productData: productData,
+        isNew: isNewProduct,
+        syncStatus: 'synced',
       );
 
       if (mounted) {
@@ -4953,9 +5058,14 @@ class AddProductScreenState extends State<AddProductScreen>
           const SnackBar(content: Text('บันทึกสินค้าเรียบร้อยแล้ว')),
         );
         unawaited(_closeDraftSessionPermanently(savedProductId: docRef.id));
-        if (mounted) {
-          Navigator.pop(context, true);
-        }
+        _completeProductSave(
+          _buildProductSaveResult(
+            productId: docRef.id,
+            productData: productData,
+            isNew: isNewProduct,
+            syncStatus: 'synced',
+          ),
+        );
       } else {
         unawaited(_closeDraftSessionPermanently(savedProductId: docRef.id));
       }
@@ -4969,10 +5079,24 @@ class AddProductScreenState extends State<AddProductScreen>
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '${e.message ?? 'การเชื่อมต่อใช้เวลานานเกินไป'} กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ ข้อมูลที่กรอกยังถูกเก็บไว้',
+              savedLocalProduct
+                  ? '${e.message ?? 'การเชื่อมต่อใช้เวลานานเกินไป'} สินค้าถูกบันทึกในเครื่องแล้ว จะ sync ขึ้นระบบเมื่อเน็ตพร้อม'
+                  : '${e.message ?? 'การเชื่อมต่อใช้เวลานานเกินไป'} กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ ข้อมูลที่กรอกยังถูกเก็บไว้',
             ),
           ),
         );
+        if (savedLocalProduct &&
+            savedProductIdForPop != null &&
+            savedProductDataForPop != null) {
+          _completeProductSave(
+            _buildProductSaveResult(
+              productId: savedProductIdForPop,
+              productData: savedProductDataForPop,
+              isNew: savedProductIsNew,
+              syncStatus: 'pending',
+            ),
+          );
+        }
       }
     } on FirebaseException catch (e) {
       if (_draftPersistenceEnabled) {

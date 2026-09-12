@@ -98,8 +98,8 @@ class LowStockProductsScreen extends StatelessWidget {
                 child: ListTile(
                   contentPadding: const EdgeInsets.all(12),
                   onTap: () async {
-                    await Navigator.of(context).push(
-                      MaterialPageRoute<void>(
+                    await Navigator.of(context).push<AddProductSaveResult>(
+                      MaterialPageRoute<AddProductSaveResult>(
                         builder: (_) => AddProductScreen(productToEdit: product),
                       ),
                     );
@@ -143,8 +143,8 @@ class LowStockProductsScreen extends StatelessWidget {
                   ),
                   trailing: OutlinedButton.icon(
                     onPressed: () async {
-                      await Navigator.of(context).push(
-                        MaterialPageRoute<void>(
+                      await Navigator.of(context).push<AddProductSaveResult>(
+                        MaterialPageRoute<AddProductSaveResult>(
                           builder: (_) => AddProductScreen(productToEdit: product),
                         ),
                       );

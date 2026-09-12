@@ -39,6 +39,12 @@ bool _isWalletNotificationAction(String? action) {
   return _walletNotificationActions.contains(normalized);
 }
 
+bool _isChatNotification(Map<String, dynamic> data) {
+  final type = (data['type'] as String?)?.trim();
+  final action = (data['action'] as String?)?.trim();
+  return type == 'chat' || action == 'chat_message';
+}
+
 String _normalizeInboxKeyPart(String? value) {
   final normalized = (value ?? '').trim().toLowerCase();
   if (normalized.isEmpty) {
@@ -261,6 +267,8 @@ class NotificationService {
   String? _handledInitialMessageId;
   final Set<String> _handledShopDecisionNotificationIds = <String>{};
   final Set<String> _shownProductAiNotificationIds = <String>{};
+  final Set<String> _shownBulkAiReadyBatchKeys = <String>{};
+  final Set<String> _shownWalletNotificationKeys = <String>{};
   final Set<String> _cancelledChannelIds = <String>{};
   String? _backgroundReturnChannelId;
   bool _shouldReturnAppToBackground = false;
@@ -455,6 +463,33 @@ class NotificationService {
     }
   }
 
+  String _walletNotificationDedupeKey(
+    Map<String, dynamic> data, {
+    String? notificationId,
+  }) {
+    final action = (data['action'] as String?)?.trim() ?? '';
+    final id = (notificationId ?? data['notificationId'] as String?)?.trim() ??
+        '';
+    if (id.isNotEmpty) {
+      return '$action|$id';
+    }
+    final title = (data['title'] as String?)?.trim() ?? '';
+    final body = (data['body'] as String?)?.trim() ?? '';
+    return '$action|$title|$body';
+  }
+
+  bool _alreadyShownWalletNotification(
+    Map<String, dynamic> data, {
+    String? notificationId,
+  }) {
+    if (!_isWalletNotificationAction(data['action'] as String?)) {
+      return false;
+    }
+    return !_shownWalletNotificationKeys.add(
+      _walletNotificationDedupeKey(data, notificationId: notificationId),
+    );
+  }
+
   Future<void> _showInboxFallbackNotification(
     String notificationId,
     Map<String, dynamic> data,
@@ -471,6 +506,10 @@ class NotificationService {
     final title = (data['title'] as String?)?.trim();
     final body = (data['body'] as String?)?.trim();
     if (title?.isNotEmpty != true && body?.isNotEmpty != true) {
+      return;
+    }
+    if (_isWalletNotificationAction(data['action'] as String?) ||
+        _isChatNotification(data)) {
       return;
     }
 
@@ -805,6 +844,25 @@ class NotificationService {
     if (notification != null ||
         (fallbackTitle?.isNotEmpty == true ||
             fallbackBody?.isNotEmpty == true)) {
+      final notificationId = (data['notificationId'] as String?)?.trim();
+      if (_isChatNotification(data)) {
+        return;
+      }
+      if (_isWalletNotificationAction(data['action'] as String?)) {
+        if (notification != null && !Platform.isAndroid) {
+          _alreadyShownWalletNotification(
+            data,
+            notificationId: notificationId,
+          );
+          return;
+        }
+        if (_alreadyShownWalletNotification(
+          data,
+          notificationId: notificationId,
+        )) {
+          return;
+        }
+      }
       await _showLocalNotification(
         title: notification?.title?.trim().isNotEmpty == true
             ? notification!.title!.trim()
@@ -1009,6 +1067,36 @@ class NotificationService {
     return null;
   }
 
+  void allowNextBulkAiReadyNotification([String? batchId]) {
+    final key = (batchId ?? '').trim();
+    if (key.isEmpty) {
+      _shownBulkAiReadyBatchKeys.clear();
+      return;
+    }
+    _shownBulkAiReadyBatchKeys.remove(key);
+  }
+
+  String? _bulkAiReadyBatchKey(Map<String, dynamic> data) {
+    final batchId = (data['batchId'] as String?)?.trim() ?? '';
+    if (batchId.isNotEmpty) {
+      return batchId;
+    }
+    final draftId = (data['draftId'] as String?)?.trim() ?? '';
+    if (draftId.contains('_bulk_')) {
+      final match = RegExp(r'(.+_bulk_\d+)').firstMatch(draftId);
+      return match?.group(1) ?? draftId;
+    }
+    return null;
+  }
+
+  bool _shouldSuppressExtraBulkAiReady(Map<String, dynamic> data) {
+    final key = _bulkAiReadyBatchKey(data);
+    if (key == null || key.isEmpty) {
+      return false;
+    }
+    return !_shownBulkAiReadyBatchKeys.add(key);
+  }
+
   String _productAiNotificationBody(Map<String, dynamic> data) {
     const prefix = 'พร้อมเติมข้อมูล: ';
     final rawBody = (data['body'] as String?)?.trim() ?? '';
@@ -1121,6 +1209,9 @@ class NotificationService {
   Future<void> _showProductAiReadyNotification(
     Map<String, dynamic> data,
   ) async {
+    if (_shouldSuppressExtraBulkAiReady(data)) {
+      return;
+    }
     final notificationId = _resolveProductAiNotificationId(data);
     if (notificationId == null ||
         !_shownProductAiNotificationIds.add(notificationId)) {

@@ -39,6 +39,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
   final List<Product> _products = [];
   final List<Product> _pendingReviewProducts = [];
   final Map<String, Map<String, dynamic>> _productRawById = {};
+  final Set<String> _pinnedLocalProductIds = {};
   bool _isLoading = false;
   bool _isFirstLoad = true;
   bool _hasMore = true;
@@ -161,81 +162,98 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     }
   }
 
-  Future<void> _fetchProducts({bool replace = false}) async {
+  Future<void> _fetchProducts({
+    bool replace = false,
+    bool userInitiated = false,
+  }) async {
     if (_isLoading && !replace) return;
     if (!replace && !_hasMore && !_isFirstLoad) return;
 
     final generation = replace ? ++_fetchGeneration : _fetchGeneration;
-    if (mounted) {
-      setState(() {
-        _isLoading = true;
-        if (replace) {
-          _loadError = null;
-        }
-      });
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (mounted) {
+        setState(() {
+          _loadError = 'ไม่พบข้อมูลผู้ใช้ กรุณาเข้าสู่ระบบใหม่';
+          _isFirstLoad = false;
+          _isLoading = false;
+        });
+      }
+      return;
     }
 
+    if (replace) {
+      final loadedLocal = await _loadProductsFromLocalCache(
+        user.uid,
+        replace: true,
+      );
+      _restorePinnedLocalProducts();
+      if (!mounted || generation != _fetchGeneration) return;
+      setState(() {
+        _isFirstLoad = false;
+        _isLoading = !loadedLocal && _products.isEmpty;
+        _loadError = null;
+      });
+      unawaited(_fetchPendingReviews().then((_) {
+        if (mounted && generation == _fetchGeneration) {
+          setState(() {});
+        }
+      }));
+      unawaited(
+        _syncProductsFromServer(
+          ownerUid: user.uid,
+          generation: generation,
+          replace: true,
+          userInitiated: userInitiated,
+        ),
+      );
+      return;
+    }
+
+    if (mounted) {
+      setState(() => _isLoading = true);
+    }
+    await _syncProductsFromServer(
+      ownerUid: user.uid,
+      generation: generation,
+      replace: false,
+      userInitiated: userInitiated,
+    );
+  }
+
+  Future<void> _syncProductsFromServer({
+    required String ownerUid,
+    required int generation,
+    required bool replace,
+    bool userInitiated = false,
+  }) async {
     try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) {
-        _loadError = 'ไม่พบข้อมูลผู้ใช้ กรุณาเข้าสู่ระบบใหม่';
-        return;
-      }
-
-      if (_products.isEmpty) {
-        await _loadProductsFromLocalCache(user.uid);
-        if (generation != _fetchGeneration) return;
-        if (mounted && _products.isNotEmpty) {
-          setState(() {
-            _isFirstLoad = false;
-            _loadError = null;
-          });
-        }
-      }
-
-      try {
-        final cachedSnapshot = await _fetchProductPage(
-          user.uid,
-          cacheOnly: true,
-        ).timeout(const Duration(seconds: 2));
-        if (generation != _fetchGeneration) return;
-        if (cachedSnapshot.docs.isNotEmpty) {
-          _applyProductDocs(
-            cachedSnapshot,
-            replace: _products.isEmpty || replace,
-          );
-          if (mounted) {
-            setState(() {
-              _isFirstLoad = false;
-              _loadError = null;
-            });
-          }
-        }
-      } catch (e) {
-        debugPrint('ShopManagementScreen cache read skipped: $e');
-      }
-
-      final pendingFuture = (_isFirstLoad || replace)
-          ? _fetchPendingReviews()
-          : null;
-
       QuerySnapshot<Map<String, dynamic>>? querySnapshot;
       Object? fetchError;
       for (var attempt = 0; attempt < 2; attempt++) {
         if (generation != _fetchGeneration) return;
         try {
           querySnapshot = await _fetchProductPage(
-            user.uid,
-          ).timeout(const Duration(seconds: 12));
+            ownerUid,
+            source: attempt == 0 ? Source.serverAndCache : Source.server,
+          ).timeout(Duration(seconds: attempt == 0 ? 18 : 24));
           fetchError = null;
           break;
         } on TimeoutException catch (e) {
           fetchError = e;
+          debugPrint(
+            'ShopManagementScreen product sync timed out '
+            '(attempt ${attempt + 1}, userInitiated=$userInitiated): $e',
+          );
         } on FirebaseException catch (e) {
           if (e.code != 'unavailable' && e.code != 'network-request-failed') {
             rethrow;
           }
           fetchError = e;
+          debugPrint(
+            'ShopManagementScreen product sync unavailable '
+            '(attempt ${attempt + 1}): ${e.code}',
+          );
         }
         if (attempt == 0) {
           await Future<void>.delayed(const Duration(seconds: 2));
@@ -244,33 +262,28 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
 
       if (generation != _fetchGeneration) return;
 
-      if (pendingFuture != null) {
-        unawaited(
-          pendingFuture.then((_) {
-            if (mounted && generation == _fetchGeneration) {
-              setState(() {});
-            }
-          }),
-        );
-      }
-
       if (querySnapshot != null) {
-        _applyProductDocs(querySnapshot, replace: replace || _products.isEmpty);
+        _applyProductDocs(
+          querySnapshot,
+          replace: userInitiated && replace,
+        );
+        _restorePinnedLocalProducts();
+        await _mergeMissingLocalProducts(ownerUid);
+        _sortProductsByCreatedAt();
         _loadError = null;
-        unawaited(_persistLocalProductCache(user.uid));
+        unawaited(_persistLocalProductCache(ownerUid));
         return;
       }
 
-      final loadedFromCache = await _loadProductsFromLocalCache(user.uid);
-      if (generation != _fetchGeneration) return;
-      if (loadedFromCache || _products.isNotEmpty) {
-        _hasMore = false;
+      if (_products.isNotEmpty) {
         _loadError = null;
-        final isCurrentRoute = mounted && (ModalRoute.of(context)?.isCurrent ?? false);
-        if (isCurrentRoute) {
+        if (userInitiated &&
+            replace &&
+            mounted &&
+            (ModalRoute.of(context)?.isCurrent ?? false)) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('เครือข่ายไม่ตอบสนอง กำลังแสดงข้อมูลที่บันทึกไว้'),
+              content: Text('เครือข่ายไม่ตอบสนอง กำลังแสดงสินค้าที่บันทึกในเครื่อง'),
             ),
           );
         }
@@ -282,17 +295,21 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       debugPrint('ShopManagementScreen Firestore error: $e');
       debugPrint('Stack: $stack');
       if (!mounted || generation != _fetchGeneration) return;
-      _hasMore = false;
+      if (!replace) {
+        _hasMore = false;
+      }
       if (_products.isEmpty) {
         _loadError =
             'เชื่อมต่อข้อมูลสินค้าไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่';
       } else {
         _loadError = null;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('รีเฟรชไม่สำเร็จ แสดงสินค้าชุดล่าสุดที่โหลดไว้'),
-          ),
-        );
+        if (userInitiated && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('รีเฟรชไม่สำเร็จ แสดงสินค้าชุดล่าสุดที่บันทึกในเครื่อง'),
+            ),
+          );
+        }
       }
     } finally {
       if (mounted && generation == _fetchGeneration) {
@@ -308,21 +325,28 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     QuerySnapshot<Map<String, dynamic>> snapshot, {
     required bool replace,
   }) {
-    if (replace) {
-      _products.clear();
-      _productRawById.clear();
-      _lastDocument = null;
-    }
-
     _hasMore = snapshot.docs.length >= _pageSize;
 
     if (snapshot.docs.isEmpty) {
       return;
     }
 
+    final pinnedRaw = <String, Map<String, dynamic>>{
+      for (final id in _pinnedLocalProductIds)
+        if (_productRawById.containsKey(id))
+          id: Map<String, dynamic>.from(_productRawById[id]!),
+    };
+
+    if (replace) {
+      _products.clear();
+      _productRawById.clear();
+      _lastDocument = null;
+    }
+
     _lastDocument = snapshot.docs.last;
     for (final doc in snapshot.docs) {
       _productRawById[doc.id] = Map<String, dynamic>.from(doc.data());
+      _pinnedLocalProductIds.remove(doc.id);
     }
     final newProducts = snapshot.docs.map(Product.fromSnapshot).toList();
     if (replace) {
@@ -340,35 +364,201 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         ),
       );
     }
+    for (final entry in pinnedRaw.entries) {
+      _productRawById.putIfAbsent(entry.key, () => entry.value);
+    }
+    _restorePinnedLocalProducts();
   }
 
   Future<void> _persistLocalProductCache(String ownerUid) async {
-    final cachedProducts = _products
-        .where((product) => product.id != null)
-        .map((product) {
-          final id = product.id!;
-          return CachedProduct(
-            id: id,
-            data: Map<String, dynamic>.from(
-              _productRawById[id] ?? product.toMap(),
-            ),
-          );
-        })
-        .toList(growable: false);
-    await ProductCacheService.instance.saveProducts(ownerUid, cachedProducts);
+    final existing = await ProductCacheService.instance.loadProducts(ownerUid);
+    final byId = <String, CachedProduct>{
+      for (final item in existing) item.id: item,
+    };
+    for (final product in _products.where((item) => item.id != null)) {
+      final id = product.id!;
+      byId[id] = CachedProduct(
+        id: id,
+        data: Map<String, dynamic>.from(
+          _productRawById[id] ?? product.toMap(),
+        ),
+      );
+    }
+    await ProductCacheService.instance.saveProducts(
+      ownerUid,
+      byId.values.toList(growable: false),
+    );
   }
 
-  Future<bool> _loadProductsFromLocalCache(String ownerUid) async {
+  int _productCreatedAtMillis(Map<String, dynamic> data) {
+    final createdAt = data['createdAt'];
+    if (createdAt is Timestamp) {
+      return createdAt.millisecondsSinceEpoch;
+    }
+    if (createdAt is num) {
+      return createdAt.toInt();
+    }
+    return 0;
+  }
+
+  void _sortProductsByCreatedAt() {
+    _products.sort((left, right) {
+      final leftId = left.id ?? '';
+      final rightId = right.id ?? '';
+      final leftMs = _productCreatedAtMillis(_productRawById[leftId] ?? const {});
+      final rightMs = _productCreatedAtMillis(_productRawById[rightId] ?? const {});
+      return rightMs.compareTo(leftMs);
+    });
+  }
+
+  void _restorePinnedLocalProducts() {
+    for (final id in _pinnedLocalProductIds) {
+      final data = _productRawById[id];
+      if (data == null || data.isEmpty) {
+        continue;
+      }
+      final product = Product.fromMap(id, data);
+      final index = _products.indexWhere((item) => item.id == id);
+      if (index >= 0) {
+        _products[index] = product;
+      } else {
+        _products.add(product);
+      }
+    }
+  }
+
+  void _applyOptimisticProductSave(AddProductSaveResult result) {
+    if (result.pendingAdminReview) {
+      unawaited(
+        _fetchPendingReviews().then((_) {
+          if (mounted) {
+            setState(() {});
+          }
+        }),
+      );
+      return;
+    }
+
+    final productId = result.productId;
+    final productData = result.productData;
+    if (productId == null ||
+        productId.isEmpty ||
+        productData == null ||
+        productData.isEmpty) {
+      return;
+    }
+
+    _pinnedLocalProductIds.add(productId);
+    _productRawById[productId] = Map<String, dynamic>.from(productData);
+    final product = Product.fromMap(productId, productData);
+    final index = _products.indexWhere((item) => item.id == productId);
+    if (index >= 0) {
+      _products[index] = product;
+    } else {
+      _products.add(product);
+    }
+    _sortProductsByCreatedAt();
+    _loadError = null;
+    _isFirstLoad = false;
+  }
+
+  void _mergeServerProductDocs(QuerySnapshot<Map<String, dynamic>> snapshot) {
+    for (final doc in snapshot.docs) {
+      _productRawById[doc.id] = Map<String, dynamic>.from(doc.data());
+      final product = Product.fromSnapshot(doc);
+      final index = _products.indexWhere((item) => item.id == doc.id);
+      if (index >= 0) {
+        _products[index] = product;
+      } else {
+        _products.add(product);
+      }
+    }
+    _sortProductsByCreatedAt();
+  }
+
+  Future<void> _syncLatestProductsFromServer(String ownerUid) async {
+    final generation = _fetchGeneration;
+    final savedLastDocument = _lastDocument;
+    _lastDocument = null;
+    try {
+      final snapshot = await _fetchProductPage(
+        ownerUid,
+        source: Source.serverAndCache,
+      ).timeout(const Duration(seconds: 18));
+      if (!mounted || generation != _fetchGeneration) {
+        return;
+      }
+      _mergeServerProductDocs(snapshot);
+      await _mergeMissingLocalProducts(ownerUid);
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('ShopManagementScreen post-save sync skipped: $e');
+    } finally {
+      _lastDocument = savedLastDocument;
+    }
+  }
+
+  Future<void> _mergeMissingLocalProducts(String ownerUid) async {
+    final cached = await ProductCacheService.instance.loadProducts(ownerUid);
+    if (cached.isEmpty) {
+      return;
+    }
+    final knownIds = _products
+        .map((product) => product.id)
+        .whereType<String>()
+        .toSet();
+    for (final item in cached) {
+      if (!knownIds.add(item.id)) {
+        continue;
+      }
+      _productRawById[item.id] = Map<String, dynamic>.from(item.data);
+      _products.add(Product.fromMap(item.id, item.data));
+    }
+  }
+
+  Future<bool> _loadProductsFromLocalCache(
+    String ownerUid, {
+    bool replace = false,
+  }) async {
     final cached = await ProductCacheService.instance.loadProducts(ownerUid);
     if (cached.isEmpty) {
       return false;
+    }
+
+    final sorted = List<CachedProduct>.from(cached)
+      ..sort(
+        (left, right) => _productCreatedAtMillis(
+          right.data,
+        ).compareTo(_productCreatedAtMillis(left.data)),
+      );
+
+    if (replace) {
+      final pinnedRaw = <String, Map<String, dynamic>>{
+        for (final id in _pinnedLocalProductIds)
+          if (_productRawById.containsKey(id))
+            id: Map<String, dynamic>.from(_productRawById[id]!),
+      };
+      _products.clear();
+      _productRawById
+        ..clear()
+        ..addAll(pinnedRaw);
+      _lastDocument = null;
+      _hasMore = false;
+      for (final item in sorted) {
+        _productRawById[item.id] = Map<String, dynamic>.from(item.data);
+        _products.add(Product.fromMap(item.id, item.data));
+      }
+      _restorePinnedLocalProducts();
+      return _products.isNotEmpty;
     }
 
     final existingIds = _products
         .map((product) => product.id)
         .whereType<String>()
         .toSet();
-    for (final item in cached) {
+    for (final item in sorted) {
       if (!existingIds.add(item.id)) {
         continue;
       }
@@ -381,10 +571,11 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
   Future<QuerySnapshot<Map<String, dynamic>>> _fetchProductPage(
     String ownerUid, {
     bool cacheOnly = false,
+    Source source = Source.server,
   }) async {
     final options = cacheOnly
         ? const GetOptions(source: Source.cache)
-        : const GetOptions();
+        : GetOptions(source: source);
     Query<Map<String, dynamic>> query = FirebaseFirestore.instance
         .collection('products')
         .where('ownerUid', isEqualTo: ownerUid)
@@ -410,12 +601,12 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     }
   }
 
-  Future<void> _refresh() async {
+  Future<void> _refresh({bool userInitiated = false}) async {
     _lastDocument = null;
     _hasMore = true;
     _isLoading = false;
     _loadError = null;
-    await _fetchProducts(replace: true);
+    await _fetchProducts(replace: true, userInitiated: userInitiated);
   }
 
   Future<bool> _ensureCanAddFirstProduct() async {
@@ -500,14 +691,52 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         }
       }
 
-      final bool? result = await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => AddProductScreen(productToEdit: product),
-        ),
-      );
-      if (result == true) {
-        _refresh();
+      var appliedOptimistic = false;
+      void applySaved(AddProductSaveResult result) {
+        if (!mounted) {
+          return;
+        }
+        _applyOptimisticProductSave(result);
+        setState(() {});
+        appliedOptimistic = true;
+      }
+
+      AddProductSaveResult? result;
+      try {
+        result = await Navigator.push<AddProductSaveResult>(
+          context,
+          MaterialPageRoute<AddProductSaveResult>(
+            builder: (context) => AddProductScreen(
+              productToEdit: product,
+              onSaved: applySaved,
+            ),
+          ),
+        );
+      } catch (e) {
+        debugPrint('ShopManagementScreen add-product pop ignored: $e');
+      }
+      if (!mounted) {
+        return;
+      }
+      if (result != null && !appliedOptimistic) {
+        applySaved(result);
+      } else if (!appliedOptimistic) {
+        final ownerUid = FirebaseAuth.instance.currentUser?.uid;
+        if (ownerUid != null && ownerUid.isNotEmpty) {
+          await _loadProductsFromLocalCache(ownerUid, replace: false);
+          _restorePinnedLocalProducts();
+          _sortProductsByCreatedAt();
+          if (mounted) {
+            setState(() {
+              _loadError = null;
+              _isFirstLoad = false;
+            });
+          }
+        }
+      }
+      final ownerUid = FirebaseAuth.instance.currentUser?.uid;
+      if (ownerUid != null && ownerUid.isNotEmpty) {
+        unawaited(_syncLatestProductsFromServer(ownerUid));
       }
     } finally {
       if (mounted) {
@@ -897,7 +1126,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
             child: Container(
               color: MerchantPremiumUi.pageBackground,
               child: RefreshIndicator(
-                onRefresh: _refresh,
+                onRefresh: () => _refresh(userInitiated: true),
                 color: AppColors.accent,
                 child: Column(children: [Expanded(child: _buildProductList())]),
               ),
@@ -997,7 +1226,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
               title: 'โหลดสินค้าไม่สำเร็จ',
               message: _loadError!,
               action: FilledButton.icon(
-                onPressed: _isLoading ? null : _refresh,
+                onPressed: _isLoading
+                    ? null
+                    : () => _refresh(userInitiated: true),
                 icon: const Icon(Icons.refresh),
                 label: const Text('ลองใหม่'),
               ),

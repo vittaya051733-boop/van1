@@ -22,9 +22,11 @@ import 'merchant_reviews_screen.dart';
 import 'services/admin_support_config.dart';
 import 'services/security_pin_service.dart';
 import 'services/biometric_auth_service.dart';
+import 'services/product_cache_service.dart';
 import 'services/shop_operations_service.dart';
 import 'services/shop_profile_cache_service.dart';
 import 'services/account_deletion_service.dart';
+import 'services/wallet_balance_loader.dart';
 import 'widgets/cached_app_image.dart';
 import 'widgets/merchant_premium_ui.dart';
 import 'widgets/operating_hours_sheet.dart';
@@ -440,6 +442,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _shopId;
   bool _operationsInitAttempted = false;
   bool _deletingAccount = false;
+  String? _accountMetricsShopId;
+  String? _walletBalanceValue;
+  int? _outstandingOrderCount;
+  int? _lowStockCount;
+
+  static const int _lowStockThreshold = 5;
+  static const int _outstandingOrdersLimit = 80;
+  static const List<String> _outstandingOrderStatuses = <String>[
+    'awaiting_rider',
+    'pending',
+    'awaiting_shop_confirmation',
+    'accepted',
+    'preparing',
+    'ready',
+    'delivering',
+    'awaiting_shipping_booking',
+  ];
+  static const Set<String> _closedOrderStatuses = <String>{
+    'delivered',
+    'cancelled',
+    'canceled',
+    'completed',
+    'refunded',
+    'rejected',
+    'payment_slip_rejected',
+    'payment_slip_error',
+  };
 
   @override
   void initState() {
@@ -453,6 +482,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     if (_shopId != null) {
       _loadOperationsSettings(_shopId!);
+      _ensureAccountMetrics(_shopId!);
     }
     _loadBiometricLoginSettings();
     _loadAppVersion();
@@ -472,6 +502,190 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final cached = await ShopProfileCacheService.instance.loadProfile(userId);
     if (!mounted || cached == null || cached.isEmpty) return;
     setState(() => _cachedShopPreview = cached);
+  }
+
+  void _ensureAccountMetrics(String shopId) {
+    if (shopId.isEmpty || _accountMetricsShopId == shopId) return;
+    _accountMetricsShopId = shopId;
+    unawaited(_loadWalletMetric(shopId));
+    unawaited(_loadOutstandingOrdersMetric(shopId));
+    unawaited(_loadLowStockMetric(shopId));
+  }
+
+  String _formatMetricBaht(double amount) {
+    final isWhole = amount == amount.roundToDouble();
+    final raw = isWhole ? amount.toStringAsFixed(0) : amount.toStringAsFixed(2);
+    final parts = raw.split('.');
+    final digits = parts.first;
+    final buffer = StringBuffer();
+    for (var i = 0; i < digits.length; i++) {
+      final remaining = digits.length - i;
+      buffer.write(digits[i]);
+      if (remaining > 1 && remaining % 3 == 1) {
+        buffer.write(',');
+      }
+    }
+    if (parts.length > 1) {
+      buffer.write('.${parts[1]}');
+    }
+    return '฿${buffer.toString()}';
+  }
+
+  int _readStock(dynamic value) {
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value.trim()) ?? 0;
+    return 0;
+  }
+
+  bool _isOutstandingShopOrder(Map<String, dynamic> data, String shopId) {
+    final ownerId = (data['shopOwnerId'] as String?)?.trim();
+    final merchantId = (data['merchantId'] as String?)?.trim();
+    final orderShopId = (data['shopId'] as String?)?.trim();
+    if (ownerId != shopId && merchantId != shopId && orderShopId != shopId) {
+      return false;
+    }
+
+    final status = (data['status'] as String?)?.trim() ?? '';
+    if (_closedOrderStatuses.contains(status) ||
+        !_outstandingOrderStatuses.contains(status)) {
+      return false;
+    }
+
+    final shopDecisionStatus =
+        (data['shopDecisionStatus'] as String?)?.trim() ?? '';
+    if (shopDecisionStatus == 'rejected' || data['shopRejectedAt'] != null) {
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _loadWalletMetric(String shopId) async {
+    try {
+      await WalletBalanceLoader.instance.loadBalanced(
+        uid: shopId,
+        actorType: 'merchant',
+        onUpdate: (view) {
+          if (!mounted) return;
+          setState(() {
+            _walletBalanceValue = _formatMetricBaht(view.creditTotal);
+          });
+        },
+      );
+    } catch (_) {
+      if (!mounted || _walletBalanceValue != null) return;
+      setState(() => _walletBalanceValue = '฿0');
+    }
+  }
+
+  Future<void> _loadOutstandingOrdersMetric(String shopId) async {
+    int countDocs(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+      return docs
+          .where((doc) => _isOutstandingShopOrder(doc.data(), shopId))
+          .length;
+    }
+
+    Future<QuerySnapshot<Map<String, dynamic>>?> getOrders({
+      required String field,
+      required bool withStatus,
+      required GetOptions options,
+      required Duration timeout,
+    }) async {
+      Query<Map<String, dynamic>> query = FirebaseFirestore.instance
+          .collection('orders')
+          .where(field, isEqualTo: shopId);
+      if (withStatus) {
+        query = query
+            .where('status', whereIn: _outstandingOrderStatuses)
+            .orderBy('createdAt', descending: true);
+      }
+      try {
+        return await query
+            .limit(withStatus ? _outstandingOrdersLimit : 200)
+            .get(options)
+            .timeout(timeout);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    Future<int?> countFromSource(GetOptions options, Duration timeout) async {
+      final ownerActive = await getOrders(
+        field: 'shopOwnerId',
+        withStatus: true,
+        options: options,
+        timeout: timeout,
+      );
+      var docs = ownerActive?.docs ?? const [];
+      if (docs.isEmpty) {
+        final ownerAll = await getOrders(
+          field: 'shopOwnerId',
+          withStatus: false,
+          options: options,
+          timeout: timeout,
+        );
+        docs = ownerAll?.docs ?? docs;
+      }
+      if (docs.isEmpty) {
+        final shopAll = await getOrders(
+          field: 'shopId',
+          withStatus: false,
+          options: options,
+          timeout: timeout,
+        );
+        docs = shopAll?.docs ?? docs;
+      }
+      if (ownerActive == null && docs.isEmpty) return null;
+      return countDocs(docs);
+    }
+
+    final cached = await countFromSource(
+      const GetOptions(source: Source.cache),
+      const Duration(milliseconds: 800),
+    );
+    if (cached != null && cached > 0 && mounted) {
+      setState(() => _outstandingOrderCount = cached);
+    }
+
+    final fresh = await countFromSource(
+      const GetOptions(source: Source.serverAndCache),
+      const Duration(seconds: 10),
+    );
+    if (!mounted) return;
+    if (fresh != null) {
+      setState(() => _outstandingOrderCount = fresh);
+    } else if (_outstandingOrderCount == null) {
+      setState(() => _outstandingOrderCount = cached ?? 0);
+    }
+  }
+
+  Future<void> _loadLowStockMetric(String shopId) async {
+    int countFromMaps(Iterable<Map<String, dynamic>> items) {
+      return items.where((data) => _readStock(data['stock']) < _lowStockThreshold).length;
+    }
+
+    try {
+      final cached = await ProductCacheService.instance.loadProducts(shopId);
+      if (cached.isNotEmpty && mounted) {
+        setState(() {
+          _lowStockCount = countFromMaps(cached.map((item) => item.data));
+        });
+      }
+    } catch (_) {}
+
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('products')
+          .where('ownerUid', isEqualTo: shopId)
+          .get(const GetOptions(source: Source.serverAndCache))
+          .timeout(const Duration(seconds: 8));
+      if (!mounted) return;
+      setState(() {
+        _lowStockCount = countFromMaps(snapshot.docs.map((doc) => doc.data()));
+      });
+    } catch (_) {
+      if (!mounted || _lowStockCount != null) return;
+      setState(() => _lowStockCount = 0);
+    }
   }
 
   Widget _buildSection({
@@ -1082,20 +1296,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _buildAccountMetric(
                     icon: Icons.account_balance_wallet_rounded,
                     label: 'ยอดเงินในกระเป๋า',
-                    value: 'ดูยอดเงิน',
+                    value: _walletBalanceValue ?? 'กำลังโหลด',
                   ),
                   const SizedBox(width: 8),
                   _buildAccountMetric(
                     icon: Icons.shopping_bag_rounded,
-                    label: 'ออเดอร์วันนี้',
-                    value: 'ดูออเดอร์',
+                    label: 'ออเดอร์ค้าง',
+                    value: _outstandingOrderCount == null
+                        ? 'กำลังโหลด'
+                        : '$_outstandingOrderCount รายการ',
                     color: MerchantPremiumUi.success,
                   ),
                   const SizedBox(width: 8),
                   _buildAccountMetric(
                     icon: Icons.inventory_2_rounded,
                     label: 'สต๊อกใกล้หมด',
-                    value: 'ดูสินค้า',
+                    value: _lowStockCount == null
+                        ? 'กำลังโหลด'
+                        : '$_lowStockCount รายการ',
                     color: AppColors.accent,
                   ),
                 ],
@@ -1456,6 +1674,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (!mounted) return;
         setState(() => _shopId = user.uid);
         _loadOperationsSettings(user.uid);
+        _ensureAccountMetrics(user.uid);
       });
     }
 
@@ -1606,6 +1825,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (!mounted) return;
         setState(() => _shopId = user.uid);
         _loadOperationsSettings(user.uid);
+        _ensureAccountMetrics(user.uid);
       });
     }
 

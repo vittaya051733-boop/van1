@@ -21,6 +21,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:van1/utils/app_check_guard.dart';
 
 import 'firebase_options.dart';
+import 'services/pending_top_up_session.dart';
 import 'services/promptpay_qr_payload.dart';
 import 'storage_helper.dart';
 
@@ -30,11 +31,13 @@ class WalletTopUpDialog extends StatefulWidget {
     this.initialAmount,
     this.minimumAmount,
     this.isSecurityDeposit = false,
+    this.resumeConfirmed = false,
   });
 
   final double? initialAmount;
   final double? minimumAmount;
   final bool isSecurityDeposit;
+  final bool resumeConfirmed;
 
   @override
   State<WalletTopUpDialog> createState() => _WalletTopUpDialogState();
@@ -55,6 +58,9 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   bool _isBusy = false;
   int _verifyProgress = 0;
   Timer? _verifyProgressTimer;
+  Timer? _inlineBannerTimer;
+  String? _inlineBanner;
+  bool _inlineBannerSuccess = false;
 
   String? _promptPayNationalId;
   String? _recipientDisplayName;
@@ -65,11 +71,17 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
   @override
   void initState() {
     super.initState();
+    PendingTopUpSession.markDialogOpen();
+    if (widget.resumeConfirmed) {
+      PendingTopUpSession.markActive();
+    }
     unawaited(_loadPaymentConfig());
   }
 
   @override
   void dispose() {
+    PendingTopUpSession.markDialogClosed();
+    _inlineBannerTimer?.cancel();
     _stopVerifyProgressTicker();
     _customAmountController.dispose();
     super.dispose();
@@ -125,6 +137,9 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
     }
     setState(() {
       _selectedAmount = initial.clamp(0, _maxTopUpAmount);
+      if (widget.resumeConfirmed) {
+        _confirmedAmount = _selectedAmount;
+      }
       _customAmountController.text = '';
     });
   }
@@ -169,6 +184,13 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       _confirmedAmount = amount;
       _selectedSlipImage = null;
     });
+    unawaited(
+      PendingTopUpSession.save(
+        amount: amount,
+        isSecurityDeposit: widget.isSecurityDeposit,
+        minimumAmount: widget.minimumAmount,
+      ),
+    );
     unawaited(_showTwoStepGuideIfNeeded());
   }
 
@@ -226,6 +248,13 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       _confirmedAmount = null;
       _selectedSlipImage = null;
     });
+    unawaited(PendingTopUpSession.clear());
+  }
+
+  Future<void> _closeWithoutCompleting() async {
+    await PendingTopUpSession.clear();
+    if (!mounted) return;
+    Navigator.of(context).pop(false);
   }
 
   double? get _amount => _selectedAmount;
@@ -590,6 +619,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
             _customAmountController.text = remainingAmount.toStringAsFixed(2);
             _selectedSlipImage = null;
           });
+          unawaited(PendingTopUpSession.clear());
           _showSnack('สร้าง QR สำหรับยอดคงเหลือเรียบร้อย');
           return;
         }
@@ -606,6 +636,8 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
           }
         }
 
+        await PendingTopUpSession.clear();
+        if (!mounted) return;
         Navigator.of(context).pop(true);
       } else {
         await showDialog<void>(
@@ -763,7 +795,18 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
 
   void _showSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    final isSuccess =
+        message.contains('เรียบร้อย') ||
+        (message.contains('สำเร็จ') && !message.contains('ไม่สำเร็จ'));
+    _inlineBannerTimer?.cancel();
+    setState(() {
+      _inlineBanner = message;
+      _inlineBannerSuccess = isSuccess;
+    });
+    _inlineBannerTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      setState(() => _inlineBanner = null);
+    });
   }
 
   void _logTopUpVerify(String message) {
@@ -1138,7 +1181,36 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
     return AlertDialog(
       backgroundColor: Colors.white,
       surfaceTintColor: Colors.white,
-      title: Text(title),
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (_inlineBanner != null) ...[
+            Material(
+              color: _inlineBannerSuccess
+                  ? const Color(0xFF15803D)
+                  : const Color(0xFFB45309),
+              borderRadius: BorderRadius.circular(10),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                child: Text(
+                  _inlineBanner!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          Text(title),
+        ],
+      ),
       content: SizedBox(
         width: 420,
         child: Stack(
@@ -1404,7 +1476,7 @@ class _WalletTopUpDialogState extends State<WalletTopUpDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: _isBusy ? null : () => Navigator.of(context).pop(false),
+          onPressed: _isBusy ? null : () => unawaited(_closeWithoutCompleting()),
           child: const Text('ปิด'),
         ),
         FilledButton(

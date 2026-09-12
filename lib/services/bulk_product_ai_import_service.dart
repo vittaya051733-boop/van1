@@ -13,6 +13,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'media_cache_service.dart';
+import 'notification_service.dart';
 import 'product_add_draft_store.dart';
 import 'product_ai_image_cache.dart';
 import 'product_draft_service.dart';
@@ -340,6 +341,7 @@ class BulkProductAiImportService {
       '_',
     );
     ensureWatching(ownerUid);
+    NotificationService().allowNextBulkAiReadyNotification(batchId);
 
     final staged = await _stageImagesLocally(
       ownerUid: ownerUid,

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -17,6 +18,7 @@ import 'chat_room_screen.dart';
 import 'services/chat_warmup.dart';
 import 'services/notification_service.dart';
 import 'services/shop_operations_service.dart';
+import 'services/shop_order_credit_gate.dart';
 import 'main.dart';
 import 'utils/product_variant_color.dart';
 import 'widgets/merchant_premium_ui.dart';
@@ -1080,15 +1082,16 @@ class _OrderManagementScreenState extends State<OrderManagementScreen> {
         ],
         onTrigger: _handleVoiceBackNavigation,
       ),
-      _VoiceCommandAction(
-        label: 'สร้างออเดอร์ทดสอบ',
-        phrases: const <String>[
-          'สร้างออเดอร์ทดสอบ',
-          'ออเดอร์ทดสอบ',
-          'สร้างเทสออเดอร์',
-        ],
-        onTrigger: _createTestOrder,
-      ),
+      if (kDebugMode)
+        _VoiceCommandAction(
+          label: 'สร้างออเดอร์ทดสอบ',
+          phrases: const <String>[
+            'สร้างออเดอร์ทดสอบ',
+            'ออเดอร์ทดสอบ',
+            'สร้างเทสออเดอร์',
+          ],
+          onTrigger: _createTestOrder,
+        ),
       _VoiceCommandAction(
         label: 'เลื่อนขึ้น',
         phrases: const <String>['เลื่อนขึ้น', 'ขึ้น', 'scrollup'],
@@ -2395,6 +2398,23 @@ extension on _OrderManagementScreenState {
         );
       }
       return;
+    }
+
+    if (silent) {
+      final enough = await ShopOrderCreditGate.hasEnoughCredit(order);
+      if (!enough) return;
+    } else {
+      final decision = await ShopOrderCreditGate.ensureCanAccept(
+        context: context,
+        order: order,
+      );
+      if (decision == ShopOrderCreditDecision.reject) {
+        await _rejectOrder(order);
+        return;
+      }
+      if (decision != ShopOrderCreditDecision.accept) {
+        return;
+      }
     }
 
     try {

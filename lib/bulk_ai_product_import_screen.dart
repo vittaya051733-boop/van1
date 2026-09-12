@@ -178,8 +178,8 @@ class _BulkAiProductImportScreenState extends State<BulkAiProductImportScreen> {
       localPath = null;
     }
     if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute<bool>(
+    await Navigator.of(context).push<AddProductSaveResult>(
+      MaterialPageRoute<AddProductSaveResult>(
         builder: (_) => AddProductScreen(
           initialLocalImagePath: localPath,
           initialImageUrl: imageUrl,

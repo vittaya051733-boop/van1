@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import 'models/order_model.dart';
 import 'admin_support_thread_screen.dart';
 import 'services/notification_service.dart';
+import 'services/shop_order_credit_gate.dart';
 import 'wallet_screen.dart';
 
 enum _NotificationCategory {
@@ -540,6 +541,21 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     String? notificationId,
   }) async {
     try {
+      final decision = await ShopOrderCreditGate.ensureCanAccept(
+        context: context,
+        order: order,
+      );
+      if (!mounted) return;
+      if (decision == ShopOrderCreditDecision.reject) {
+        await _rejectOrderFromNotification(
+          order: order,
+          notificationId: notificationId,
+        );
+        return;
+      }
+      if (decision != ShopOrderCreditDecision.accept) {
+        return;
+      }
       await _notificationService.acceptShopOrder(
         order,
         notificationId: notificationId,

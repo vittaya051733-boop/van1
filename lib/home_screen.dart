@@ -7,9 +7,11 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'wallet_screen.dart';
+import 'wallet_top_up_dialog.dart';
 import 'notifications_screen.dart';
 import 'settings_screen.dart';
 import 'shipping_screen.dart';
+import 'add_product_screen.dart';
 import 'shop_management_screen.dart';
 import 'order_management_screen_new.dart';
 import 'driver_scanner_screen.dart';
@@ -22,6 +24,7 @@ import 'services/shop_operations_service.dart';
 import 'services/video_prefetch_service.dart';
 import 'services/friend_warmup_service.dart';
 import 'services/ecosystem_heartbeat_service.dart';
+import 'services/pending_top_up_session.dart';
 import 'models/shop_operations_settings.dart';
 import 'merchant_pricing_policy.dart';
 import 'models/product_variant.dart';
@@ -219,10 +222,14 @@ class _HomeScreenState extends State<HomeScreen>
     // Mount the order listener with Home so the tab is warm before first tap.
     _pages[2] = const OrderManagementScreen();
     _tabController.addListener(_handleTabChange);
+    ProductSaveNavigation.revealShopManagement = _revealShopManagementTab;
     _loadShopDetails();
     _startChatWarmup();
     _startBackgroundListeners();
     EcosystemHeartbeatService.instance.start();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_restorePendingTopUpIfNeeded());
+    });
 
     // บังคับให้ System Navigation Bar เป็นสีขาวเมื่อเข้า Home
     SystemChrome.setSystemUIOverlayStyle(
@@ -241,8 +248,41 @@ class _HomeScreenState extends State<HomeScreen>
     // switching apps on the same device. Stop only when process is gone.
     if (state == AppLifecycleState.resumed) {
       EcosystemHeartbeatService.instance.start();
+      unawaited(_restorePendingTopUpIfNeeded());
     } else if (state == AppLifecycleState.detached) {
       EcosystemHeartbeatService.instance.stop();
+    }
+  }
+
+  Future<void> _restorePendingTopUpIfNeeded() async {
+    if (!mounted ||
+        PendingTopUpSession.isDialogOpen ||
+        PendingTopUpSession.isRestoreInFlight) {
+      return;
+    }
+    final pending = await PendingTopUpSession.load();
+    if (pending == null ||
+        !mounted ||
+        PendingTopUpSession.isDialogOpen ||
+        PendingTopUpSession.isRestoreInFlight) {
+      return;
+    }
+
+    PendingTopUpSession.beginRestore();
+    PendingTopUpSession.markActive();
+    try {
+      await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => WalletTopUpDialog(
+          initialAmount: pending.amount,
+          minimumAmount: pending.minimumAmount,
+          isSecurityDeposit: pending.isSecurityDeposit,
+          resumeConfirmed: true,
+        ),
+      );
+    } finally {
+      PendingTopUpSession.endRestore();
     }
   }
 
@@ -295,6 +335,24 @@ class _HomeScreenState extends State<HomeScreen>
   bool _isProductAiReadyNotification(Map<String, dynamic> data) {
     return (data['action'] as String?)?.trim() == 'product_ai_ready' ||
         (data['type'] as String?)?.trim() == 'product_ai_ready';
+  }
+
+  bool _isWalletStatusNotification(Map<String, dynamic> data) {
+    const actions = {
+      'payout_pending',
+      'payout_paid',
+      'credit_released',
+      'top_up_verified',
+      'credit_adjusted',
+      'security_deposit_paid',
+    };
+    return actions.contains((data['action'] as String?)?.trim());
+  }
+
+  bool _isChatNotification(Map<String, dynamic> data) {
+    final type = (data['type'] as String?)?.trim();
+    final action = (data['action'] as String?)?.trim();
+    return type == 'chat' || action == 'chat_message';
   }
 
   Future<void> _loadShopDetails() async {
@@ -532,7 +590,12 @@ class _HomeScreenState extends State<HomeScreen>
 
             if (newDocs.isNotEmpty) {
               final overlayDocs = newDocs
-                  .where((doc) => !_isProductAiReadyNotification(doc.data()))
+                  .where((doc) {
+                    final data = doc.data();
+                    return !_isProductAiReadyNotification(data) &&
+                        !_isWalletStatusNotification(data) &&
+                        !_isChatNotification(data);
+                  })
                   .toList(growable: false);
               if (overlayDocs.isNotEmpty) {
                 final latest = overlayDocs.first.data();
@@ -1055,6 +1118,9 @@ class _HomeScreenState extends State<HomeScreen>
     WidgetsBinding.instance.removeObserver(this);
     _notificationSubscription?.cancel();
     _shopOperationsSubscription?.cancel();
+    if (ProductSaveNavigation.revealShopManagement == _revealShopManagementTab) {
+      ProductSaveNavigation.revealShopManagement = null;
+    }
     _tabController.removeListener(_handleTabChange);
     _tabController.dispose();
     _shopProfileRetryTimer?.cancel();
@@ -1131,6 +1197,17 @@ class _HomeScreenState extends State<HomeScreen>
       setState(() => _pages[index] = _buildPage(index));
     }
     _tabController.animateTo(index);
+  }
+
+  void _revealShopManagementTab() {
+    if (!mounted) {
+      return;
+    }
+    _pages[1] ??= _buildPage(1);
+    if (_currentIndex == 1) {
+      return;
+    }
+    _switchToTab(1);
   }
 
   @override

@@ -2,7 +2,7 @@ name: van1
 description: "Van 1 Flutter project."
 publish_to: 'none'
 
-version: 1.0.15+29
+version: 1.0.15+30
 
 environment:
   sdk: ^3.9.0
