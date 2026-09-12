@@ -7,6 +7,11 @@ analyzer:
     - "**/*.g.dart"
     - "**/*.freezed.dart"
     - lib/app/app_widget.widgetbook.dart
+    - android/**
+    - ios/**
+    - windows/**
+    - macos/**
+    - linux/**
   language:
     strict-inference: false
     strict-raw-types: false

@@ -12,7 +12,9 @@ import 'storage_helper.dart';
 import 'utils/app_colors.dart';
 import 'utils/product_image_url.dart';
 import 'widgets/product_network_image.dart';
+import 'widgets/merchant_premium_ui.dart';
 import 'wallet_top_up_dialog.dart';
+
 class ShopManagementScreen extends StatefulWidget {
   final Set<String>? initialHomeProductIds;
   final Function(Set<String>)? onHomeProductIdsChanged;
@@ -58,9 +60,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       _products.where((product) => !product.isPendingAdminReview).toList();
 
   List<Product> get _displayProducts => [
-        ..._pendingReviewProducts,
-        ..._products,
-      ];
+    ..._pendingReviewProducts,
+    ..._products,
+  ];
 
   @override
   void initState() {
@@ -213,17 +215,18 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         debugPrint('ShopManagementScreen cache read skipped: $e');
       }
 
-      final pendingFuture =
-          (_isFirstLoad || replace) ? _fetchPendingReviews() : null;
+      final pendingFuture = (_isFirstLoad || replace)
+          ? _fetchPendingReviews()
+          : null;
 
       QuerySnapshot<Map<String, dynamic>>? querySnapshot;
       Object? fetchError;
       for (var attempt = 0; attempt < 2; attempt++) {
         if (generation != _fetchGeneration) return;
         try {
-          querySnapshot = await _fetchProductPage(user.uid).timeout(
-            const Duration(seconds: 12),
-          );
+          querySnapshot = await _fetchProductPage(
+            user.uid,
+          ).timeout(const Duration(seconds: 12));
           fetchError = null;
           break;
         } on TimeoutException catch (e) {
@@ -252,10 +255,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       }
 
       if (querySnapshot != null) {
-        _applyProductDocs(
-          querySnapshot,
-          replace: replace || _products.isEmpty,
-        );
+        _applyProductDocs(querySnapshot, replace: replace || _products.isEmpty);
         _loadError = null;
         unawaited(_persistLocalProductCache(user.uid));
         return;
@@ -266,7 +266,8 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       if (loadedFromCache || _products.isNotEmpty) {
         _hasMore = false;
         _loadError = null;
-        if (mounted) {
+        final isCurrentRoute = mounted && (ModalRoute.of(context)?.isCurrent ?? false);
+        if (isCurrentRoute) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('เครือข่ายไม่ตอบสนอง กำลังแสดงข้อมูลที่บันทึกไว้'),
@@ -329,8 +330,10 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         ..clear()
         ..addAll(newProducts);
     } else {
-      final existingIds =
-          _products.map((p) => p.id).whereType<String>().toSet();
+      final existingIds = _products
+          .map((p) => p.id)
+          .whereType<String>()
+          .toSet();
       _products.addAll(
         newProducts.where(
           (product) => product.id == null || existingIds.add(product.id!),
@@ -446,9 +449,8 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     final agreed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
         fullscreenDialog: true,
-        builder: (_) => MerchantSecurityDepositScreen(
-          requiredAmountBaht: requiredAmount,
-        ),
+        builder: (_) =>
+            MerchantSecurityDepositScreen(requiredAmountBaht: requiredAmount),
       ),
     );
     if (agreed != true || !mounted) {
@@ -474,7 +476,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     if (!paid && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('ยังไม่สามารถเริ่มอัปโหลดได้ — กรุณาชำระค่าประกันให้ครบ'),
+          content: Text(
+            'ยังไม่สามารถเริ่มอัปโหลดได้ — กรุณาชำระค่าประกันให้ครบ',
+          ),
         ),
       );
     }
@@ -525,8 +529,14 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         title: const Text('ยืนยันการลบ'),
         content: Text('คุณต้องการลบสินค้า "${product.name}" ใช่หรือไม่?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('ยกเลิก')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('ลบ', style: TextStyle(color: Colors.red))),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('ยกเลิก'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('ลบ', style: TextStyle(color: Colors.red)),
+          ),
         ],
       ),
     );
@@ -550,13 +560,21 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
           .doc('main')
           .delete()
           .catchError((_) => null);
-      await FirebaseFirestore.instance.collection('products').doc(product.id!).delete();
+      await FirebaseFirestore.instance
+          .collection('products')
+          .doc(product.id!)
+          .delete();
       final currentUserId = FirebaseAuth.instance.currentUser?.uid;
       if (currentUserId != null && currentUserId.isNotEmpty) {
-        await ProductCacheService.instance.removeProduct(currentUserId, product.id!);
+        await ProductCacheService.instance.removeProduct(
+          currentUserId,
+          product.id!,
+        );
       }
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('ลบสินค้าเรียบร้อยแล้ว')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('ลบสินค้าเรียบร้อยแล้ว')));
         setState(() {
           _products.removeWhere((p) => p.id == product.id);
           _productRawById.remove(product.id!);
@@ -564,7 +582,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('เกิดข้อผิดพลาดในการลบ: $e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('เกิดข้อผิดพลาดในการลบ: $e')));
       }
     } finally {
       if (mounted) {
@@ -580,7 +600,8 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       ...product.imageUrls.where((url) => url.trim().isNotEmpty),
       ...product.thumbnailUrls.where((url) => url.trim().isNotEmpty),
       if ((product.videoUrl ?? '').trim().isNotEmpty) product.videoUrl!.trim(),
-      if ((product.videoThumbnailUrl ?? '').trim().isNotEmpty) product.videoThumbnailUrl!.trim(),
+      if ((product.videoThumbnailUrl ?? '').trim().isNotEmpty)
+        product.videoThumbnailUrl!.trim(),
     };
 
     for (final url in mediaUrls) {
@@ -642,7 +663,10 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     await _saveProductDiscount(product, saved);
   }
 
-  Future<void> _saveProductDiscount(Product product, double discountPercent) async {
+  Future<void> _saveProductDiscount(
+    Product product,
+    double discountPercent,
+  ) async {
     if (product.id == null) {
       return;
     }
@@ -652,12 +676,13 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     });
 
     try {
-      await FirebaseFirestore.instance.collection('products').doc(product.id!).update(
-        <String, dynamic>{
-          'discountPercent': discountPercent,
-          'updatedAt': FieldValue.serverTimestamp(),
-        },
-      );
+      await FirebaseFirestore.instance
+          .collection('products')
+          .doc(product.id!)
+          .update(<String, dynamic>{
+            'discountPercent': discountPercent,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
 
       final currentUserId = FirebaseAuth.instance.currentUser?.uid;
       if (currentUserId != null && currentUserId.isNotEmpty) {
@@ -698,9 +723,9 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       );
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('บันทึกส่วนลดไม่สำเร็จ: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('บันทึกส่วนลดไม่สำเร็จ: $e')));
       }
     } finally {
       if (mounted) {
@@ -829,37 +854,56 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       debugPrint('Failed to delete storage file $url: $e');
     }
   }
-  
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: MerchantPremiumUi.pageBackground,
       appBar: AppBar(
-        leading: IconButton(
-          onPressed: _publishedProducts.isEmpty ? null : _toggleSelectAllHomeProducts,
-          tooltip: _areAllProductsSelected ? 'ยกเลิกเลือกทั้งหมด' : 'เลือกสินค้าทั้งหมด',
-          icon: Icon(
-            _areAllProductsSelected ? Icons.radio_button_unchecked : Icons.task_alt,
-            color: Colors.white,
-          ),
-        ),
-        title: const Text('จัดการร้านค้า'),
         automaticallyImplyLeading: false,
-        backgroundColor: AppColors.accent,
-        surfaceTintColor: AppColors.accent,
-        foregroundColor: Colors.white,
-      ),
-      body: Container(
-        color: Colors.white,
-        child: RefreshIndicator(
-          onRefresh: _refresh,
-          color: AppColors.accent,
-          child: Column(
-            children: [
-              Expanded(child: _buildProductList()),
-            ],
+        title: const SizedBox.shrink(),
+        leading: IconButton(
+          onPressed: _publishedProducts.isEmpty
+              ? null
+              : _toggleSelectAllHomeProducts,
+          tooltip: _areAllProductsSelected
+              ? 'ยกเลิกเลือกทั้งหมด'
+              : 'เลือกสินค้าทั้งหมด',
+          icon: Icon(
+            _areAllProductsSelected
+                ? Icons.radio_button_unchecked
+                : Icons.task_alt,
+            color: AppColors.accentDark,
           ),
         ),
+        flexibleSpace: const SafeArea(
+          child: Center(
+            child: Text(
+              'จัดการสินค้า',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20),
+            ),
+          ),
+        ),
+        backgroundColor: MerchantPremiumUi.pageBackground,
+        surfaceTintColor: MerchantPremiumUi.pageBackground,
+        foregroundColor: MerchantPremiumUi.ink,
+        elevation: 0,
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: Container(
+              color: MerchantPremiumUi.pageBackground,
+              child: RefreshIndicator(
+                onRefresh: _refresh,
+                color: AppColors.accent,
+                child: Column(children: [Expanded(child: _buildProductList())]),
+              ),
+            ),
+          ),
+        ],
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: _isOpeningAddProduct
@@ -867,6 +911,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
             : () => _navigateToAddProduct(context),
         tooltip: 'เพิ่มสินค้า',
         backgroundColor: AppColors.accent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: _isOpeningAddProduct
             ? const SizedBox(
                 width: 22,
@@ -881,34 +926,38 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     );
   }
 
-    /// Toggle the ready-for-sale status for every currently loaded product at once.
-    void _toggleSelectAllHomeProducts() {
-      final productIds = _publishedProducts
-          .where((p) => p.id != null)
-          .map((p) => p.id!)
-          .toSet();
-      if (productIds.isEmpty) return;
+  /// Toggle the ready-for-sale status for every currently loaded product at once.
+  void _toggleSelectAllHomeProducts() {
+    final productIds = _publishedProducts
+        .where((p) => p.id != null)
+        .map((p) => p.id!)
+        .toSet();
+    if (productIds.isEmpty) return;
 
-      final shouldSelectAll = !_areAllProductsSelected;
-      setState(() {
-        if (shouldSelectAll) {
-          _homeProductIds.addAll(productIds);
-        } else {
-          _homeProductIds.removeAll(productIds);
-        }
-      });
+    final shouldSelectAll = !_areAllProductsSelected;
+    setState(() {
+      if (shouldSelectAll) {
+        _homeProductIds.addAll(productIds);
+      } else {
+        _homeProductIds.removeAll(productIds);
+      }
+    });
 
-      widget.onHomeProductIdsChanged?.call(_homeProductIds);
+    widget.onHomeProductIdsChanged?.call(_homeProductIds);
 
-      final messenger = ScaffoldMessenger.of(context);
-      messenger.hideCurrentSnackBar();
-      messenger.showSnackBar(
-        SnackBar(
-          content: Text(shouldSelectAll ? 'เลือกสถานะพร้อมขายสำหรับสินค้าทั้งหมดแล้ว' : 'ยกเลิกสถานะพร้อมขายสำหรับสินค้าทั้งหมดแล้ว'),
-          duration: const Duration(seconds: 2),
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          shouldSelectAll
+              ? 'เลือกสถานะพร้อมขายสำหรับสินค้าทั้งหมดแล้ว'
+              : 'ยกเลิกสถานะพร้อมขายสำหรับสินค้าทั้งหมดแล้ว',
         ),
-      );
-    }
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
 
   List<String> _productImageCandidates(Product product) {
     final id = product.id;
@@ -942,27 +991,16 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
         physics: const AlwaysScrollableScrollPhysics(),
         children: [
           SizedBox(
-            height: 320,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.cloud_off_rounded, size: 64, color: Colors.grey[500]),
-                const SizedBox(height: 16),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 28),
-                  child: Text(
-                    _loadError!,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 15, color: Colors.grey[700]),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                FilledButton.icon(
-                  onPressed: _isLoading ? null : _refresh,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('ลองใหม่'),
-                ),
-              ],
+            height: 360,
+            child: PremiumEmptyState(
+              icon: Icons.cloud_off_rounded,
+              title: 'โหลดสินค้าไม่สำเร็จ',
+              message: _loadError!,
+              action: FilledButton.icon(
+                onPressed: _isLoading ? null : _refresh,
+                icon: const Icon(Icons.refresh),
+                label: const Text('ลองใหม่'),
+              ),
             ),
           ),
         ],
@@ -972,24 +1010,13 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
     if (_displayProducts.isEmpty) {
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
-        children: [
+        children: const [
           SizedBox(
             height: 320,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.inbox_outlined, size: 80, color: Colors.grey[400]),
-                const SizedBox(height: 16),
-                const Text(
-                  'ยังไม่มีสินค้าในร้านของคุณ',
-                  style: TextStyle(fontSize: 18, color: Colors.grey),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'แตะปุ่ม + มุมขวาล่างเพื่อเพิ่มสินค้า',
-                  style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-                ),
-              ],
+            child: PremiumEmptyState(
+              icon: Icons.inventory_2_outlined,
+              title: 'ยังไม่มีสินค้าในร้านของคุณ',
+              message: 'แตะปุ่ม + มุมขวาล่างเพื่อเพิ่มสินค้า',
             ),
           ),
         ],
@@ -998,7 +1025,7 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
 
     return GridView.builder(
       controller: _scrollController,
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         crossAxisSpacing: 16,
@@ -1008,70 +1035,59 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
       itemBuilder: (context, index) {
         if (index >= _displayProducts.length) {
           return _isLoading
-              ? const Center(child: Padding(
-                  padding: EdgeInsets.all(8.0),
-                  child: CircularProgressIndicator(),
-                ))
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: CircularProgressIndicator(),
+                  ),
+                )
               : const SizedBox.shrink();
         }
         final product = _displayProducts[index];
         final isPendingReview = product.isPendingAdminReview;
-        final isDeleting = !isPendingReview &&
+        final isDeleting =
+            !isPendingReview &&
             product.id != null &&
             _deletingProductIds.contains(product.id!);
-        final isUpdatingDiscount = !isPendingReview &&
+        final isUpdatingDiscount =
+            !isPendingReview &&
             product.id != null &&
             _updatingDiscountProductIds.contains(product.id!);
         final isBusy = isDeleting || isUpdatingDiscount;
-        final isHome = !isPendingReview &&
+        final isHome =
+            !isPendingReview &&
             product.id != null &&
             _homeProductIds.contains(product.id!);
         final previewCandidates = _productImageCandidates(product);
         return Container(
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(16),
-              boxShadow: const [
-                BoxShadow(
-                  color: Colors.black12,
-                  blurRadius: 6,
-                  offset: Offset(0, 3),
-                ),
-              ],
-              border: Border.all(
-                color: isPendingReview
-                    ? const Color(0xFFFF8F00)
-                    : Colors.grey[300]!,
-                width: isPendingReview ? 2 : 1,
-              ),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(16),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (previewCandidates.isNotEmpty)
-                    ProductNetworkImage(
-                      key: ValueKey<String>(
-                        'shop-product-image-${product.id ?? index}',
-                      ),
-                      urls: previewCandidates,
-                      fit: BoxFit.cover,
-                      memCacheWidth: 400,
-                    )
-                  else
-                    ColoredBox(
-                      color: Colors.grey[200]!,
-                      child: const Center(
-                        child: Icon(
-                          Icons.image,
-                          size: 40,
-                          color: Colors.grey,
-                        ),
-                      ),
+          decoration: MerchantPremiumUi.cardDecoration(
+            borderColor: isPendingReview
+                ? const Color(0xFFFF8F00)
+                : MerchantPremiumUi.line,
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(22),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (previewCandidates.isNotEmpty)
+                  ProductNetworkImage(
+                    key: ValueKey<String>(
+                      'shop-product-image-${product.id ?? index}',
                     ),
-                  Positioned.fill(
-                    child: GestureDetector(
+                    urls: previewCandidates,
+                    fit: BoxFit.cover,
+                    memCacheWidth: 400,
+                  )
+                else
+                  ColoredBox(
+                    color: Colors.grey[200]!,
+                    child: const Center(
+                      child: Icon(Icons.image, size: 40, color: Colors.grey),
+                    ),
+                  ),
+                Positioned.fill(
+                  child: GestureDetector(
                     behavior: HitTestBehavior.translucent,
                     onTap: isBusy
                         ? null
@@ -1082,13 +1098,13 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                               _navigateToAddProduct(context, product: product);
                             }
                           },
-                    ),
                   ),
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: Container(
+                ),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Container(
                     padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
                     decoration: const BoxDecoration(
                       borderRadius: BorderRadius.only(
@@ -1115,7 +1131,13 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                             fontWeight: FontWeight.w700,
                             fontSize: 16,
                             color: Colors.white,
-                            shadows: [Shadow(color: Colors.black54, offset: Offset(0, 1), blurRadius: 2)],
+                            shadows: [
+                              Shadow(
+                                color: Colors.black54,
+                                offset: Offset(0, 1),
+                                blurRadius: 2,
+                              ),
+                            ],
                           ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -1123,13 +1145,19 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                         const SizedBox(height: 2),
                         Text(
                           'ราคา: ${product.price} บาท',
-                          style: const TextStyle(fontSize: 14, color: Colors.white70),
+                          style: const TextStyle(
+                            fontSize: 14,
+                            color: Colors.white70,
+                          ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                         Text(
                           'สต็อก: ${product.stock}',
-                          style: const TextStyle(fontSize: 13, color: Colors.white70),
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Colors.white70,
+                          ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
@@ -1151,36 +1179,41 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                   ),
                 ),
                 if (isPendingReview)
-                  Positioned(
-                    top: 8,
-                    left: 8,
-                    child: _buildPendingReviewBadge(),
-                  )
+                  Positioned(top: 8, left: 8, child: _buildPendingReviewBadge())
                 else
                   Positioned(
                     top: 8,
                     left: 8,
                     child: GestureDetector(
-                      onTap: isBusy || product.id == null ? null : () {
-                        setState(() {
-                          if (isHome) {
-                            _homeProductIds.remove(product.id!);
-                          } else {
-                            _homeProductIds.add(product.id!);
-                          }
-                          if (widget.onHomeProductIdsChanged != null) {
-                            widget.onHomeProductIdsChanged!(_homeProductIds);
-                          }
-                        });
-                      },
+                      onTap: isBusy || product.id == null
+                          ? null
+                          : () {
+                              setState(() {
+                                if (isHome) {
+                                  _homeProductIds.remove(product.id!);
+                                } else {
+                                  _homeProductIds.add(product.id!);
+                                }
+                                if (widget.onHomeProductIdsChanged != null) {
+                                  widget.onHomeProductIdsChanged!(
+                                    _homeProductIds,
+                                  );
+                                }
+                              });
+                            },
                       child: Container(
                         width: 28,
                         height: 28,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: isHome ? AppColors.accent : Colors.grey,
-                          border: Border.all(color: Colors.white, width: 2)),
-                        child: const Icon(Icons.check, color: Colors.white, size: 18),
+                          border: Border.all(color: Colors.white, width: 2),
+                        ),
+                        child: const Icon(
+                          Icons.check,
+                          color: Colors.white,
+                          size: 18,
+                        ),
                       ),
                     ),
                   ),
@@ -1228,8 +1261,10 @@ class _ShopManagementScreenState extends State<ShopManagementScreen> {
                                 backgroundColor: const Color(0xFF1565C0),
                                 iconColor: Colors.white,
                                 tooltip: 'แก้ไขสินค้า',
-                                onPressed: () =>
-                                    _navigateToAddProduct(context, product: product),
+                                onPressed: () => _navigateToAddProduct(
+                                  context,
+                                  product: product,
+                                ),
                               ),
                               const SizedBox(width: 4),
                               _buildProductActionButton(
@@ -1330,10 +1365,7 @@ class _DiscountPercentDialogState extends State<_DiscountPercentDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('ยกเลิก'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('บันทึก'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('บันทึก')),
       ],
     );
   }

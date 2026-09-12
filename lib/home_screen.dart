@@ -29,6 +29,7 @@ import 'utils/product_variant_color.dart';
 import 'utils/shop_profile_resolver.dart';
 import 'utils/product_image_url.dart';
 import 'widgets/product_network_image.dart';
+import 'widgets/merchant_premium_ui.dart';
 
 class _HomeProductVariantDisplay {
   const _HomeProductVariantDisplay({
@@ -100,11 +101,7 @@ _HomeProductVariantDisplay _resolveHomeProductDisplay(
   final hasVariants = ProductVariantSupport.productHasVariants(data);
   final variants = ProductVariantSupport.parseList(data['variants']);
   final scopedVariants = hasVariants
-      ? ProductVariantSupport.variantsForImageIndex(
-          variants,
-          data,
-          imageIndex,
-        )
+      ? ProductVariantSupport.variantsForImageIndex(variants, data, imageIndex)
       : const <ProductVariant>[];
 
   if (!hasVariants || scopedVariants.isEmpty) {
@@ -126,14 +123,11 @@ _HomeProductVariantDisplay _resolveHomeProductDisplay(
   final priceLabel = ProductVariantSupport.formatPriceRange(basePrices);
   final discountedPriceLabel = ProductVariantSupport.formatPriceRange(
     scopedVariants.map(
-      (variant) => MerchantPricingPolicy.applyDiscount(
-        variant.price,
-        discountPercent,
-      ),
+      (variant) =>
+          MerchantPricingPolicy.applyDiscount(variant.price, discountPercent),
     ),
   );
-  final stockLabel =
-      ProductVariantSupport.sumStock(scopedVariants).toString();
+  final stockLabel = ProductVariantSupport.sumStock(scopedVariants).toString();
   final colors = ProductVariantSupport.uniqueOptionValues(
     scopedVariants,
     colors: true,
@@ -321,6 +315,7 @@ class _HomeScreenState extends State<HomeScreen>
       }
 
       DocumentSnapshot<Map<String, dynamic>>? foundSnapshot;
+      var bestScore = -1;
 
       for (final collectionName in collectionsToCheck) {
         final snapshot = await _readRegistrationDoc(
@@ -329,9 +324,13 @@ class _HomeScreenState extends State<HomeScreen>
           logOnFailure: collectionsToCheck.length == 1,
         );
         if (snapshot == null) continue;
-        foundSnapshot = snapshot;
-        unawaited(_rememberShopCollection(user.uid, collectionName));
-        break;
+        final score = _shopProfileSnapshotScore(snapshot);
+        if (score > bestScore) {
+          foundSnapshot = snapshot;
+          bestScore = score;
+          unawaited(_rememberShopCollection(user.uid, collectionName));
+        }
+        if (score >= 2) break;
       }
 
       if (foundSnapshot == null || !foundSnapshot.exists) {
@@ -344,8 +343,12 @@ class _HomeScreenState extends State<HomeScreen>
         userId: user.uid,
         snapshot: foundSnapshot,
       );
-      _shopProfileRetryTimer?.cancel();
-      _shopProfileRetryAttempt = 0;
+      if (_shopProfileLooksIncomplete) {
+        _scheduleShopProfileRetry(user.uid);
+      } else {
+        _shopProfileRetryTimer?.cancel();
+        _shopProfileRetryAttempt = 0;
+      }
     } catch (e) {
       debugPrint('Failed to load shop details: $e');
       final uid = _currentUserId ?? FirebaseAuth.instance.currentUser?.uid;
@@ -365,8 +368,9 @@ class _HomeScreenState extends State<HomeScreen>
     final String? imageUrl = ShopProfileResolver.resolveImageUrl(data);
     final String? name = ShopProfileResolver.resolveName(data);
     final bool isOpen = data['isOpen'] as bool? ?? true;
-    final Set<String> homeIds =
-        ((data['homeProductIds'] as List?) ?? const []).whereType<String>().toSet();
+    final Set<String> homeIds = ((data['homeProductIds'] as List?) ?? const [])
+        .whereType<String>()
+        .toSet();
 
     setState(() {
       _shopDocRef = snapshot.reference;
@@ -380,10 +384,23 @@ class _HomeScreenState extends State<HomeScreen>
       _homeProductIds = homeIds;
       _pages[0] = _buildPage(0);
     });
-    unawaited(ShopProfileCacheService.instance.saveProfile(userId, {
+    final profileForCache = <String, dynamic>{
       ...data,
       'registrationCollection': snapshot.reference.parent.id,
-    }));
+    };
+    if ((imageUrl == null || imageUrl.isEmpty) &&
+        _shopImageUrl != null &&
+        _shopImageUrl!.trim().isNotEmpty) {
+      profileForCache['shopImageUrl'] = _shopImageUrl;
+    }
+    if ((name == null || name.isEmpty) &&
+        _shopName != null &&
+        _shopName!.trim().isNotEmpty) {
+      profileForCache['shopName'] = _shopName;
+    }
+    unawaited(
+      ShopProfileCacheService.instance.saveProfile(userId, profileForCache),
+    );
     unawaited(_syncShopOperationsStatus(userId, isOpen));
     _updateHomeProductsCache();
 
@@ -515,9 +532,7 @@ class _HomeScreenState extends State<HomeScreen>
 
             if (newDocs.isNotEmpty) {
               final overlayDocs = newDocs
-                  .where(
-                    (doc) => !_isProductAiReadyNotification(doc.data()),
-                  )
+                  .where((doc) => !_isProductAiReadyNotification(doc.data()))
                   .toList(growable: false);
               if (overlayDocs.isNotEmpty) {
                 final latest = overlayDocs.first.data();
@@ -561,8 +576,8 @@ class _HomeScreenState extends State<HomeScreen>
         .whereType<String>()
         .toSet();
     final isOpen = cached['isOpen'] as bool? ?? true;
-    final registrationCollection =
-        (cached['registrationCollection'] as String?)?.trim();
+    final registrationCollection = (cached['registrationCollection'] as String?)
+        ?.trim();
 
     setState(() {
       if (registrationCollection != null && registrationCollection.isNotEmpty) {
@@ -706,9 +721,18 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<List<String>> _collectionsToCheck(User user) async {
+    final ordered = <String>[];
+    void addCollection(String? collection) {
+      final trimmed = collection?.trim();
+      if (trimmed == null || trimmed.isEmpty || ordered.contains(trimmed)) {
+        return;
+      }
+      ordered.add(trimmed);
+    }
+
     final knownCollection = await _loadKnownShopCollection(user.uid);
     if (knownCollection != null) {
-      return <String>[knownCollection];
+      addCollection(knownCollection);
     }
 
     try {
@@ -719,7 +743,7 @@ class _HomeScreenState extends State<HomeScreen>
           .timeout(_firestoreCacheTimeout);
       final serviceType = contractDoc.data()?['serviceType'] as String?;
       if (serviceType != null && serviceType.trim().isNotEmpty) {
-        return <String>[_collectionForServiceType(serviceType)];
+        addCollection(_collectionForServiceType(serviceType));
       }
     } catch (_) {}
 
@@ -731,7 +755,7 @@ class _HomeScreenState extends State<HomeScreen>
           .timeout(_firestoreServerTimeout);
       final serviceType = contractDoc.data()?['serviceType'] as String?;
       if (serviceType != null && serviceType.trim().isNotEmpty) {
-        return <String>[_collectionForServiceType(serviceType)];
+        addCollection(_collectionForServiceType(serviceType));
       }
     } catch (error) {
       if (error is! TimeoutException) {
@@ -739,7 +763,23 @@ class _HomeScreenState extends State<HomeScreen>
       }
     }
 
-    return const <String>['shop_registrations'];
+    for (final collection in _registrationFallbackCollections) {
+      addCollection(collection);
+    }
+    return ordered;
+  }
+
+  int _shopProfileSnapshotScore(
+    DocumentSnapshot<Map<String, dynamic>> snapshot,
+  ) {
+    final data = snapshot.data();
+    if (data == null) return 0;
+    var score = 0;
+    final imageUrl = ShopProfileResolver.resolveImageUrl(data);
+    final name = ShopProfileResolver.resolveName(data);
+    if (name != null && name.trim().isNotEmpty) score++;
+    if (imageUrl != null && imageUrl.trim().isNotEmpty) score++;
+    return score;
   }
 
   Future<void> _probeOtherRegistrationCollections(String userId) async {
@@ -764,15 +804,16 @@ class _HomeScreenState extends State<HomeScreen>
       return saved;
     }
 
-    final pendingServiceType =
-        prefs.getString('pending_reg_service_type')?.trim();
+    final pendingServiceType = prefs
+        .getString('pending_reg_service_type')
+        ?.trim();
     if (pendingServiceType != null && pendingServiceType.isNotEmpty) {
       return _collectionForServiceType(pendingServiceType);
     }
 
     final cached = await ShopProfileCacheService.instance.loadProfile(userId);
-    final cachedCollection =
-        (cached?['registrationCollection'] as String?)?.trim();
+    final cachedCollection = (cached?['registrationCollection'] as String?)
+        ?.trim();
     if (cachedCollection != null && cachedCollection.isNotEmpty) {
       return cachedCollection;
     }
@@ -1114,15 +1155,15 @@ class _HomeScreenState extends State<HomeScreen>
               top: false,
               minimum: EdgeInsets.zero,
               child: ColoredBox(
-                color: Colors.white,
+                color: MerchantPremiumUi.pageBackground,
                 child: Padding(
-                  padding: const EdgeInsets.only(top: 4),
+                  padding: const EdgeInsets.only(top: 6, bottom: 4),
                   child: SizedBox(
-                    height: 65,
+                    height: 66,
                     child: Center(
                       child: SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        padding: const EdgeInsets.symmetric(horizontal: 14),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -1223,69 +1264,58 @@ class _HomeScreenState extends State<HomeScreen>
     int badgeCount = 0,
   }) {
     final bool isSelected = _currentIndex == index;
-    final Color circleColor = isSelected
-        ? AppColors.accentLight
-        : const Color(0xFFE6E6E6);
     final Color iconColor = isSelected
-        ? AppColors.accent
+        ? AppColors.accentDark
         : AppColors.neutralIcon;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 5),
       child: InkWell(
         onTap: () => _switchToTab(index),
         borderRadius: BorderRadius.circular(48),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        child: Stack(
+          clipBehavior: Clip.none,
           children: [
-            Stack(
-              clipBehavior: Clip.none,
-              children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  width: 62,
-                  height: 62,
-                  decoration: BoxDecoration(
-                    color: circleColor,
-                    shape: BoxShape.circle,
-                    boxShadow: isSelected
-                        ? [
-                            BoxShadow(
-                              color: AppColors.accent.withOpacity(0.3),
-                              blurRadius: 12,
-                              offset: const Offset(0, 6),
-                            ),
-                          ]
-                        : null,
-                  ),
-                  child: Icon(icon, color: iconColor, size: 28),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: 54,
+              height: 54,
+              decoration: BoxDecoration(
+                color: isSelected ? Colors.white : const Color(0xFFFFF0E1),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: isSelected
+                      ? AppColors.accent.withValues(alpha: 0.36)
+                      : Colors.white,
                 ),
-                if (badgeCount > 0)
-                  Positioned(
-                    right: -4,
-                    top: -4,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.red,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.white, width: 2),
-                      ),
-                      child: Text(
-                        badgeCount > 99 ? '99+' : badgeCount.toString(),
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
+                boxShadow: isSelected ? MerchantPremiumUi.softShadow : null,
+              ),
+              child: Icon(icon, color: iconColor, size: 26),
+            ),
+            if (badgeCount > 0)
+              Positioned(
+                right: -4,
+                top: -4,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.red,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white, width: 2),
+                  ),
+                  child: Text(
+                    badgeCount > 99 ? '99+' : badgeCount.toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-              ],
-            ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1488,412 +1518,487 @@ class _HomeDashboard extends StatelessWidget {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final ImageProvider? avatarImage =
-        (shopImageUrl != null && shopImageUrl!.isNotEmpty)
-        ? NetworkImage(shopImageUrl!)
-        : null;
+  Widget _buildHomeHero() {
     final String displayName = (shopName != null && shopName!.isNotEmpty)
         ? shopName!
-        : '-';
-
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: AppColors.accent,
-        elevation: 0,
-        surfaceTintColor: AppColors.accent,
-        leadingWidth: 150,
-        leading: Padding(
-          padding: const EdgeInsets.only(left: 12, top: 6, bottom: 6),
-          child: _ShopStatusToggle(
-            isOpen: isShopOpen,
-            onToggle: onToggleShopStatus,
+        : 'ร้านค้าของฉัน';
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        gradient: MerchantPremiumUi.heroGradient,
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(color: MerchantPremiumUi.line),
+        boxShadow: MerchantPremiumUi.softShadow,
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 58,
+            height: 58,
+            padding: const EdgeInsets.all(3),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+            ),
+            child: CircleAvatar(
+              backgroundColor: AppColors.accentLight,
+              backgroundImage:
+                  (shopImageUrl != null && shopImageUrl!.isNotEmpty)
+                  ? NetworkImage(shopImageUrl!)
+                  : null,
+              child: shopImageUrl == null || shopImageUrl!.isEmpty
+                  ? const Icon(
+                      Icons.storefront,
+                      color: AppColors.accentDark,
+                      size: 30,
+                    )
+                  : null,
+            ),
           ),
-        ),
-        title: Text(
-          displayName,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
-          ),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: GestureDetector(
-              onTap: onProfileTap,
-              child: SizedBox(
-                width: 68,
-                height: 68,
-                child: CircleAvatar(
-                  radius: 34,
-                  backgroundColor: AppColors.accent,
-                  backgroundImage: avatarImage,
-                  child: avatarImage == null
-                      ? const Icon(
-                          Icons.account_circle,
-                          color: Colors.white,
-                          size: 42,
-                        )
-                      : null,
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: MerchantPremiumUi.ink,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _ShopStatusToggle(
+                      isOpen: isShopOpen,
+                      onToggle: onToggleShopStatus,
+                      width: 124,
+                    ),
+                  ],
                 ),
-              ),
+                const SizedBox(height: 7),
+                PremiumStatusChip(
+                  icon: isShopOpen
+                      ? Icons.check_circle_rounded
+                      : Icons.pause_circle_filled_rounded,
+                  label: isShopOpen ? 'ออนไลน์ / เปิดทำการ' : 'ปิดชั่วคราว',
+                  color: isShopOpen
+                      ? MerchantPremiumUi.success
+                      : AppColors.accentDark,
+                ),
+              ],
             ),
           ),
         ],
       ),
-      body: !isShopOpen
-          ? Center(
-              child: Container(
-                margin: const EdgeInsets.all(24),
-                padding: const EdgeInsets.all(32),
-                decoration: BoxDecoration(
-                  color: Colors.grey[100],
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: Colors.grey[300]!, width: 1.5),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.store_mall_directory_outlined,
-                      size: 80,
-                      color: Colors.grey[400],
-                    ),
-                    const SizedBox(height: 24),
-                    Text(
-                      'ร้านปิดชั่วคราว',
-                      style: TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.grey[700],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      'ขออภัยค่ะ ร้านค้าปิดทำการในขณะนี้\nกรุณากลับมาใหม่ภายหลัง',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 16,
-                        color: Colors.grey[600],
-                        height: 1.5,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          : homeProductIds == null || homeProductIds!.isEmpty
-          ? const Center(
-              child: Text(
-                'ยังไม่มีสินค้าที่เลือกแสดงบนหน้าโฮม',
-                style: TextStyle(fontSize: 18),
-              ),
-            )
-          : FutureBuilder<List<CachedProduct>>(
-              future: homeProductsFuture,
-              builder: (context, snapshot) {
-                final List<CachedProduct> docs =
-                    snapshot.data ?? cachedProducts;
-                final bool showLoading =
-                    snapshot.connectionState == ConnectionState.waiting &&
-                    docs.isEmpty;
+    );
+  }
 
-                if (showLoading) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: MerchantPremiumUi.pageBackground,
+      body: SafeArea(
+        child: Column(
+          children: [
+            GestureDetector(onTap: onProfileTap, child: _buildHomeHero()),
+            Expanded(
+              child: !isShopOpen
+                  ? const PremiumEmptyState(
+                      icon: Icons.store_mall_directory_outlined,
+                      title: 'ร้านปิดชั่วคราว',
+                      message:
+                          'ขออภัยค่ะ ร้านค้าปิดทำการในขณะนี้\nกรุณากลับมาใหม่ภายหลัง',
+                    )
+                  : homeProductIds == null || homeProductIds!.isEmpty
+                  ? const PremiumEmptyState(
+                      icon: Icons.widgets_outlined,
+                      title: 'ยังไม่มีสินค้าในหน้าโฮม',
+                      message:
+                          'เลือกสินค้าจากหน้า จัดการร้านค้า เพื่อแสดงบนหน้าโฮม',
+                    )
+                  : FutureBuilder<List<CachedProduct>>(
+                      future: homeProductsFuture,
+                      builder: (context, snapshot) {
+                        final List<CachedProduct> docs =
+                            snapshot.data ?? cachedProducts;
+                        final bool showLoading =
+                            snapshot.connectionState ==
+                                ConnectionState.waiting &&
+                            docs.isEmpty;
 
-                if (snapshot.hasError && docs.isEmpty) {
-                  return Center(
-                    child: Text(
-                      'เกิดข้อผิดพลาดในการโหลดสินค้า: ${snapshot.error}',
-                      textAlign: TextAlign.center,
-                    ),
-                  );
-                }
+                        if (showLoading) {
+                          return const Center(
+                            child: CircularProgressIndicator(),
+                          );
+                        }
 
-                if (docs.isEmpty) {
-                  return const Center(
-                    child: Text(
-                      'ไม่พบสินค้าที่เลือก',
-                      style: TextStyle(fontSize: 18),
-                    ),
-                  );
-                }
-                String? selectedTypeKey;
-                final typeGroups = _groupHomeProductsByType(docs);
-                final showTypeFilters =
-                    typeGroups.length > 1 ||
-                    (typeGroups.isNotEmpty &&
-                        typeGroups.first.label != 'อื่นๆ');
-
-                return StatefulBuilder(
-                  builder: (context, setFilterState) {
-                    final visibleDocs = selectedTypeKey == null
-                        ? docs
-                        : typeGroups
-                              .where((group) => group.key == selectedTypeKey)
-                              .expand((group) => group.products)
-                              .toList(growable: false);
-
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (showTypeFilters) ...[
-                          SizedBox(
-                            height: 58,
-                            child: ListView(
-                              scrollDirection: Axis.horizontal,
-                              padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
-                              children: [
-                                Padding(
-                                  padding: const EdgeInsets.only(right: 8),
-                                  child: FilterChip(
-                                    label: const Text('ทั้งหมด'),
-                                    selected: selectedTypeKey == null,
-                                    onSelected: (_) => setFilterState(
-                                      () => selectedTypeKey = null,
-                                    ),
-                                    selectedColor: const Color(0xFFFFEDD5),
-                                    checkmarkColor: AppColors.accent,
-                                  ),
-                                ),
-                                for (final group in typeGroups)
-                                  Padding(
-                                    padding: const EdgeInsets.only(right: 8),
-                                    child: FilterChip(
-                                      label: Text(group.label),
-                                      selected: selectedTypeKey == group.key,
-                                      onSelected: (_) => setFilterState(
-                                        () => selectedTypeKey = group.key,
-                                      ),
-                                      selectedColor: const Color(0xFFFFEDD5),
-                                      checkmarkColor: AppColors.accent,
-                                    ),
-                                  ),
-                              ],
+                        if (snapshot.hasError && docs.isEmpty) {
+                          return Center(
+                            child: Text(
+                              'เกิดข้อผิดพลาดในการโหลดสินค้า: ${snapshot.error}',
+                              textAlign: TextAlign.center,
                             ),
-                          ),
-                        ],
-                        Expanded(
-                          child: GridView.builder(
-                            padding: const EdgeInsets.all(16),
-                            gridDelegate:
-                                const SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: 2,
-                                  mainAxisSpacing: 16,
-                                  crossAxisSpacing: 16,
-                                ),
-                            itemCount: visibleDocs.length,
-                            itemBuilder: (context, index) {
-                              final doc = visibleDocs[index];
-                              final data = doc.data;
-                              final imageCandidates =
-                                  readProductImageUrlCandidates(data);
-                              final String? imageUrl = imageCandidates.isNotEmpty
-                                  ? imageCandidates.first
-                                  : null;
-                              final name = (data['name'] ?? '').toString();
-                              final discountPercent =
-                                  MerchantPricingPolicy.parseDiscountPercent(
-                                    data['discountPercent'],
-                                  );
-                              final display = _resolveHomeProductDisplay(
-                                data,
-                                imageIndex: 0,
-                              );
-                              final description = (data['description'] ?? '')
-                                  .toString();
+                          );
+                        }
 
-                              return GestureDetector(
-                                onTap: () {
-                                  _prefetchProductVideos(visibleDocs, index);
-                                  final modalData = Map<String, dynamic>.from(
-                                    data,
-                                  );
-                                  modalData['documentId'] = doc.id;
-                                  _showProductGallery(
-                                    context,
-                                    modalData,
-                                    preferredFirstUrl: imageUrl,
-                                  );
-                                },
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(16),
-                                    boxShadow: const [
-                                      BoxShadow(
-                                        color: Colors.black12,
-                                        blurRadius: 6,
-                                        offset: Offset(0, 3),
+                        if (docs.isEmpty) {
+                          return const Center(
+                            child: Text(
+                              'ไม่พบสินค้าที่เลือก',
+                              style: TextStyle(fontSize: 18),
+                            ),
+                          );
+                        }
+                        String? selectedTypeKey;
+                        final typeGroups = _groupHomeProductsByType(docs);
+                        final showTypeFilters =
+                            typeGroups.length > 1 ||
+                            (typeGroups.isNotEmpty &&
+                                typeGroups.first.label != 'อื่นๆ');
+
+                        return StatefulBuilder(
+                          builder: (context, setFilterState) {
+                            final visibleDocs = selectedTypeKey == null
+                                ? docs
+                                : typeGroups
+                                      .where(
+                                        (group) => group.key == selectedTypeKey,
+                                      )
+                                      .expand((group) => group.products)
+                                      .toList(growable: false);
+
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (showTypeFilters) ...[
+                                  SizedBox(
+                                    height: 58,
+                                    child: ListView(
+                                      scrollDirection: Axis.horizontal,
+                                      padding: const EdgeInsets.fromLTRB(
+                                        16,
+                                        10,
+                                        16,
+                                        8,
                                       ),
-                                    ],
-                                  ),
-                                  child: ClipRRect(
-                                    borderRadius: BorderRadius.circular(16),
-                                    child: Stack(
                                       children: [
-                                        Positioned.fill(
-                                          child: ProductNetworkImage(
-                                            key: ValueKey<String>(
-                                              'home-img-${doc.id}',
-                                            ),
-                                            urls: imageCandidates,
-                                            fit: BoxFit.cover,
-                                            memCacheWidth: 400,
-                                          ),
-                                        ),
-                                        Positioned(
-                                          left: 0,
-                                          right: 0,
-                                          bottom: 0,
-                                          child: Container(
-                                            padding: const EdgeInsets.fromLTRB(
-                                              12,
-                                              14,
-                                              12,
-                                              12,
-                                            ),
-                                            decoration: const BoxDecoration(
-                                              gradient: LinearGradient(
-                                                begin: Alignment.bottomCenter,
-                                                end: Alignment.topCenter,
-                                                colors: [
-                                                  Color(0xCC000000),
-                                                  Color(0x66000000),
-                                                  Color(0x00000000),
-                                                ],
-                                              ),
-                                            ),
-                                            child: Column(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                Text(
-                                                  name,
-                                                  style: const TextStyle(
-                                                    fontSize: 16,
-                                                    fontWeight: FontWeight.w700,
-                                                    color: Colors.white,
-                                                    shadows: [
-                                                      Shadow(
-                                                        color: Colors.black54,
-                                                        offset: Offset(0, 1),
-                                                        blurRadius: 2,
-                                                      ),
-                                                    ],
-                                                  ),
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                ),
-                                                const SizedBox(height: 2),
-                                                if (display.hasOptions) ...[
-                                                  _buildHomeVariantOptionsDisplay(
-                                                    display,
-                                                    onDarkBackground: true,
-                                                  ),
-                                                  const SizedBox(height: 2),
-                                                ],
-                                                if (discountPercent > 0) ...[
-                                                  Text(
-                                                    'ราคาเต็ม: ${display.priceLabel} บาท',
-                                                    style: const TextStyle(
-                                                      fontSize: 12,
-                                                      color: Colors.white60,
-                                                      decoration: TextDecoration
-                                                          .lineThrough,
-                                                    ),
-                                                    maxLines: 1,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                  ),
-                                                  const SizedBox(height: 2),
-                                                  Text(
-                                                    'หลังลด: ${display.discountedPriceLabel} บาท',
-                                                    style: const TextStyle(
-                                                      fontSize: 13,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                      color: Color(0xFFFFD180),
-                                                    ),
-                                                    maxLines: 1,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                  ),
-                                                ] else
-                                                  Text(
-                                                    'ราคา: ${display.priceLabel} บาท',
-                                                    style: const TextStyle(
-                                                      fontSize: 13,
-                                                      color: Colors.white70,
-                                                    ),
-                                                    maxLines: 1,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                  ),
-                                                Text(
-                                                  'สต๊อก: ${display.stockLabel}',
-                                                  style: const TextStyle(
-                                                    fontSize: 13,
-                                                    color: Colors.white70,
-                                                  ),
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                ),
-                                                _MerchantProductRatingSummary(
-                                                  productId: doc.id,
-                                                  compact: true,
-                                                ),
-                                                if (description.isNotEmpty) ...[
-                                                  const SizedBox(height: 4),
-                                                  Text(
-                                                    description,
-                                                    style: const TextStyle(
-                                                      fontSize: 12,
-                                                      color: Colors.white70,
-                                                      fontStyle:
-                                                          FontStyle.italic,
-                                                    ),
-                                                    maxLines: 2,
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                  ),
-                                                ],
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                        if (discountPercent > 0)
-                                          Positioned(
-                                            top: 8,
+                                        Padding(
+                                          padding: const EdgeInsets.only(
                                             right: 8,
-                                            child: _buildHomeDiscountBadge(
-                                              discountPercent,
+                                          ),
+                                          child: FilterChip(
+                                            label: const Text('ทั้งหมด'),
+                                            selected: selectedTypeKey == null,
+                                            onSelected: (_) => setFilterState(
+                                              () => selectedTypeKey = null,
+                                            ),
+                                            selectedColor: const Color(
+                                              0xFFFFEDD5,
+                                            ),
+                                            checkmarkColor: AppColors.accent,
+                                          ),
+                                        ),
+                                        for (final group in typeGroups)
+                                          Padding(
+                                            padding: const EdgeInsets.only(
+                                              right: 8,
+                                            ),
+                                            child: FilterChip(
+                                              label: Text(group.label),
+                                              selected:
+                                                  selectedTypeKey == group.key,
+                                              onSelected: (_) => setFilterState(
+                                                () =>
+                                                    selectedTypeKey = group.key,
+                                              ),
+                                              selectedColor: const Color(
+                                                0xFFFFEDD5,
+                                              ),
+                                              checkmarkColor: AppColors.accent,
                                             ),
                                           ),
                                       ],
                                     ),
                                   ),
+                                ],
+                                Expanded(
+                                  child: GridView.builder(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      8,
+                                      16,
+                                      18,
+                                    ),
+                                    gridDelegate:
+                                        const SliverGridDelegateWithFixedCrossAxisCount(
+                                          crossAxisCount: 2,
+                                          mainAxisSpacing: 16,
+                                          crossAxisSpacing: 16,
+                                        ),
+                                    itemCount: visibleDocs.length,
+                                    itemBuilder: (context, index) {
+                                      final doc = visibleDocs[index];
+                                      final data = doc.data;
+                                      final imageCandidates =
+                                          readProductImageUrlCandidates(data);
+                                      final String? imageUrl =
+                                          imageCandidates.isNotEmpty
+                                          ? imageCandidates.first
+                                          : null;
+                                      final name = (data['name'] ?? '')
+                                          .toString();
+                                      final discountPercent =
+                                          MerchantPricingPolicy.parseDiscountPercent(
+                                            data['discountPercent'],
+                                          );
+                                      final display =
+                                          _resolveHomeProductDisplay(
+                                            data,
+                                            imageIndex: 0,
+                                          );
+                                      final description =
+                                          (data['description'] ?? '')
+                                              .toString();
+
+                                      return GestureDetector(
+                                        onTap: () {
+                                          _prefetchProductVideos(
+                                            visibleDocs,
+                                            index,
+                                          );
+                                          final modalData =
+                                              Map<String, dynamic>.from(data);
+                                          modalData['documentId'] = doc.id;
+                                          _showProductGallery(
+                                            context,
+                                            modalData,
+                                            preferredFirstUrl: imageUrl,
+                                          );
+                                        },
+                                        child: Container(
+                                          decoration:
+                                              MerchantPremiumUi.cardDecoration(),
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(
+                                              22,
+                                            ),
+                                            child: Stack(
+                                              children: [
+                                                Positioned.fill(
+                                                  child: ProductNetworkImage(
+                                                    key: ValueKey<String>(
+                                                      'home-img-${doc.id}',
+                                                    ),
+                                                    urls: imageCandidates,
+                                                    fit: BoxFit.cover,
+                                                    memCacheWidth: 400,
+                                                  ),
+                                                ),
+                                                Positioned(
+                                                  left: 0,
+                                                  right: 0,
+                                                  bottom: 0,
+                                                  child: Container(
+                                                    padding:
+                                                        const EdgeInsets.fromLTRB(
+                                                          12,
+                                                          14,
+                                                          12,
+                                                          12,
+                                                        ),
+                                                    decoration:
+                                                        const BoxDecoration(
+                                                          gradient:
+                                                              LinearGradient(
+                                                                begin: Alignment
+                                                                    .bottomCenter,
+                                                                end: Alignment
+                                                                    .topCenter,
+                                                                colors: [
+                                                                  Color(
+                                                                    0xCC000000,
+                                                                  ),
+                                                                  Color(
+                                                                    0x66000000,
+                                                                  ),
+                                                                  Color(
+                                                                    0x00000000,
+                                                                  ),
+                                                                ],
+                                                              ),
+                                                        ),
+                                                    child: Column(
+                                                      crossAxisAlignment:
+                                                          CrossAxisAlignment
+                                                              .start,
+                                                      mainAxisSize:
+                                                          MainAxisSize.min,
+                                                      children: [
+                                                        Text(
+                                                          name,
+                                                          style: const TextStyle(
+                                                            fontSize: 16,
+                                                            fontWeight:
+                                                                FontWeight.w700,
+                                                            color: Colors.white,
+                                                            shadows: [
+                                                              Shadow(
+                                                                color: Colors
+                                                                    .black54,
+                                                                offset: Offset(
+                                                                  0,
+                                                                  1,
+                                                                ),
+                                                                blurRadius: 2,
+                                                              ),
+                                                            ],
+                                                          ),
+                                                          maxLines: 1,
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                        ),
+                                                        const SizedBox(
+                                                          height: 2,
+                                                        ),
+                                                        if (display
+                                                            .hasOptions) ...[
+                                                          _buildHomeVariantOptionsDisplay(
+                                                            display,
+                                                            onDarkBackground:
+                                                                true,
+                                                          ),
+                                                          const SizedBox(
+                                                            height: 2,
+                                                          ),
+                                                        ],
+                                                        if (discountPercent >
+                                                            0) ...[
+                                                          Text(
+                                                            'ราคาเต็ม: ${display.priceLabel} บาท',
+                                                            style: const TextStyle(
+                                                              fontSize: 12,
+                                                              color: Colors
+                                                                  .white60,
+                                                              decoration:
+                                                                  TextDecoration
+                                                                      .lineThrough,
+                                                            ),
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                          ),
+                                                          const SizedBox(
+                                                            height: 2,
+                                                          ),
+                                                          Text(
+                                                            'หลังลด: ${display.discountedPriceLabel} บาท',
+                                                            style:
+                                                                const TextStyle(
+                                                                  fontSize: 13,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w700,
+                                                                  color: Color(
+                                                                    0xFFFFD180,
+                                                                  ),
+                                                                ),
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                          ),
+                                                        ] else
+                                                          Text(
+                                                            'ราคา: ${display.priceLabel} บาท',
+                                                            style:
+                                                                const TextStyle(
+                                                                  fontSize: 13,
+                                                                  color: Colors
+                                                                      .white70,
+                                                                ),
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                          ),
+                                                        Text(
+                                                          'สต๊อก: ${display.stockLabel}',
+                                                          style:
+                                                              const TextStyle(
+                                                                fontSize: 13,
+                                                                color: Colors
+                                                                    .white70,
+                                                              ),
+                                                          maxLines: 1,
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                        ),
+                                                        _MerchantProductRatingSummary(
+                                                          productId: doc.id,
+                                                          compact: true,
+                                                        ),
+                                                        if (description
+                                                            .isNotEmpty) ...[
+                                                          const SizedBox(
+                                                            height: 4,
+                                                          ),
+                                                          Text(
+                                                            description,
+                                                            style:
+                                                                const TextStyle(
+                                                                  fontSize: 12,
+                                                                  color: Colors
+                                                                      .white70,
+                                                                  fontStyle:
+                                                                      FontStyle
+                                                                          .italic,
+                                                                ),
+                                                            maxLines: 2,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                          ),
+                                                        ],
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                                if (discountPercent > 0)
+                                                  Positioned(
+                                                    top: 8,
+                                                    right: 8,
+                                                    child:
+                                                        _buildHomeDiscountBadge(
+                                                          discountPercent,
+                                                        ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
                                 ),
-                              );
-                            },
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                );
-              },
+                              ],
+                            );
+                          },
+                        );
+                      },
+                    ),
             ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -1961,30 +2066,42 @@ List<_HomeProductTypeGroup> _groupHomeProductsByType(
 
 String _readHomeProductTypeLabel(Map<String, dynamic> data) {
   const fallbackType = 'อื่นๆ';
-  final source = [
+  final semanticSource = [
     data['name'],
     data['description'],
     data['productName'],
-    data['productCategory'],
-    data['aiProductType'],
-    data['productType'],
-    data['catalogHeading'],
-    data['catalogType'],
   ].map((value) => value?.toString().trim() ?? '').join(' ').toLowerCase();
 
-  if (_isHomePharmacyProduct(source)) {
-    return 'ยาและเวชภัณฑ์';
-  }
-
-  final marketType = _readHomeMarketProductTypeLabel(source);
+  // ชื่อและรายละเอียดสินค้าที่รู้จักต้องชนะค่าหมวดเก่าที่อาจค้างอยู่
+  // เช่น แก้วมังกรที่เคยถูกบันทึก catalogType เป็นยาและเวชภัณฑ์
+  final marketType = _readHomeMarketProductTypeLabel(semanticSource);
   if (marketType != null) {
     return marketType;
   }
+  if (_isHomePharmacyProduct(semanticSource)) {
+    return 'ยาและเวชภัณฑ์';
+  }
 
+  // ใช้หมวดมาตรฐานที่ Cloud Function/AI จำแนกไว้เป็นแหล่งข้อมูลหลัก
   final catalogType = (data['catalogType'] ?? '').toString().trim();
   if (catalogType.isNotEmpty) {
     return catalogType;
   }
+
+  final aiSource = [
+    data['productCategory'],
+    data['aiProductType'],
+    data['productType'],
+    data['catalogHeading'],
+  ].map((value) => value?.toString().trim() ?? '').join(' ').toLowerCase();
+  final aiMarketType = _readHomeMarketProductTypeLabel(aiSource);
+  if (aiMarketType != null) {
+    return aiMarketType;
+  }
+  if (_isHomePharmacyProduct(aiSource)) {
+    return 'ยาและเวชภัณฑ์';
+  }
+
   final aiType = (data['aiProductType'] ?? '').toString().trim();
   if (aiType.isNotEmpty) {
     return aiType;
@@ -2594,12 +2711,16 @@ class _ProductGalleryContentState extends State<_ProductGalleryContent> {
         : (hasVideo ? 1 : 0);
     final canSwipe = totalPages > 1;
     final onVideoPage = hasVideo && _currentIndex == totalPages - 1;
-    final imageIndex = hasImages && !onVideoPage && _currentIndex < widget.images.length
+    final imageIndex =
+        hasImages && !onVideoPage && _currentIndex < widget.images.length
         ? _currentIndex
         : 0;
     final display = onVideoPage
         ? _resolveHomeProductDisplay(widget.productData, imageIndex: 0)
-        : _resolveHomeProductDisplay(widget.productData, imageIndex: imageIndex);
+        : _resolveHomeProductDisplay(
+            widget.productData,
+            imageIndex: imageIndex,
+          );
     final priceLine = display.discountPercent > 0
         ? 'ราคาเต็ม: ${display.priceLabel} บาท · หลังลด: ${display.discountedPriceLabel} บาท'
         : 'ราคา: ${display.priceLabel} บาท';
@@ -2813,17 +2934,21 @@ class _ProductGalleryContentState extends State<_ProductGalleryContent> {
 }
 
 class _ShopStatusToggle extends StatefulWidget {
-  const _ShopStatusToggle({required this.isOpen, required this.onToggle});
+  const _ShopStatusToggle({
+    required this.isOpen,
+    required this.onToggle,
+    this.width = 160,
+  });
 
   final bool isOpen;
   final ValueChanged<bool> onToggle;
+  final double width;
 
   @override
   State<_ShopStatusToggle> createState() => _ShopStatusToggleState();
 }
 
 class _ShopStatusToggleState extends State<_ShopStatusToggle> {
-  static const double _toggleWidth = 160;
   static const double _padding = 4;
 
   double? _dragFraction;
@@ -2864,7 +2989,7 @@ class _ShopStatusToggleState extends State<_ShopStatusToggle> {
   }
 
   void _handleDragUpdate(DragUpdateDetails details) {
-    final availableWidth = _toggleWidth - (_padding * 2);
+    final availableWidth = widget.width - (_padding * 2);
     if (availableWidth <= 0) return;
     final delta = (details.primaryDelta ?? 0) / availableWidth;
     setState(() {
@@ -2903,7 +3028,7 @@ class _ShopStatusToggleState extends State<_ShopStatusToggle> {
         onHorizontalDragEnd: _handleDragEnd,
         onHorizontalDragCancel: () => setState(() => _dragFraction = null),
         child: Container(
-          width: _toggleWidth,
+          width: widget.width,
           height: 40,
           decoration: BoxDecoration(
             color: Colors.white,
@@ -2959,6 +3084,7 @@ class _ShopStatusToggleState extends State<_ShopStatusToggle> {
                           color: highlightOpen
                               ? Colors.white
                               : Colors.grey[700],
+                          fontSize: widget.width < 140 ? 12 : 14,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
@@ -2972,6 +3098,7 @@ class _ShopStatusToggleState extends State<_ShopStatusToggle> {
                           color: highlightOpen
                               ? Colors.grey[700]
                               : Colors.white,
+                          fontSize: widget.width < 140 ? 12 : 14,
                           fontWeight: FontWeight.w700,
                         ),
                       ),

@@ -257,6 +257,8 @@ class NotificationService {
   StreamSubscription<User?>? _shopDecisionAuthSubscription;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
   _shopDecisionNotificationSubscription;
+  bool _shopDecisionListenerPrimed = false;
+  String? _handledInitialMessageId;
   final Set<String> _handledShopDecisionNotificationIds = <String>{};
   final Set<String> _shownProductAiNotificationIds = <String>{};
   final Set<String> _cancelledChannelIds = <String>{};
@@ -285,6 +287,12 @@ class NotificationService {
     if (settings.authorizationStatus == AuthorizationStatus.authorized) {
       debugPrint('User granted notification permission');
     }
+
+    await _firebaseMessaging.setForegroundNotificationPresentationOptions(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
 
     // Initialize local notifications
     const androidSettings = AndroidInitializationSettings(
@@ -332,7 +340,18 @@ class NotificationService {
 
     final initialMessage = await _firebaseMessaging.getInitialMessage();
     if (initialMessage != null) {
-      _handleNotificationTap(initialMessage);
+      final messageId =
+          initialMessage.messageId ??
+          (initialMessage.data['notificationId'] as String?)?.trim();
+      final sentAt = initialMessage.sentTime;
+      final isFresh =
+          sentAt == null ||
+          DateTime.now().difference(sentAt) <= const Duration(minutes: 2);
+      if (isFresh &&
+          (messageId == null || messageId != _handledInitialMessageId)) {
+        _handledInitialMessageId = messageId;
+        _handleNotificationTap(initialMessage);
+      }
     }
 
     _startShopDecisionNotificationListener();
@@ -346,6 +365,7 @@ class NotificationService {
         .listen((user) {
           _shopDecisionNotificationSubscription?.cancel();
           _shopDecisionNotificationSubscription = null;
+          _shopDecisionListenerPrimed = false;
           _handledShopDecisionNotificationIds.clear();
           _shownProductAiNotificationIds.clear();
 
@@ -354,6 +374,7 @@ class NotificationService {
             return;
           }
 
+          debugPrint('Listening for van1 app_notifications uid=$uid');
           _shopDecisionNotificationSubscription = FirebaseFirestore.instance
               .collection('app_notifications')
               .where('targetApp', isEqualTo: 'van1')
@@ -374,6 +395,16 @@ class NotificationService {
   Future<void> _handleShopDecisionNotificationSnapshot(
     QuerySnapshot<Map<String, dynamic>> snapshot,
   ) async {
+    if (!_shopDecisionListenerPrimed) {
+      _shopDecisionListenerPrimed = true;
+      for (final doc in snapshot.docs) {
+        _handledShopDecisionNotificationIds.add(doc.id);
+      }
+      return;
+    }
+    debugPrint(
+      'van1 app_notifications snapshot changes=${snapshot.docChanges.length}',
+    );
     final changes = snapshot.docChanges
         .where((change) {
           return change.type == DocumentChangeType.added ||
@@ -411,6 +442,7 @@ class NotificationService {
         continue;
       }
       if (!_isIncomingShopDecisionNotification(data)) {
+        await _showInboxFallbackNotification(notificationId, data);
         continue;
       }
 
@@ -421,6 +453,40 @@ class NotificationService {
       };
       await _showIncomingOrderDecisionPrompt(payload);
     }
+  }
+
+  Future<void> _showInboxFallbackNotification(
+    String notificationId,
+    Map<String, dynamic> data,
+  ) async {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid.trim();
+    final recipientUid = (data['recipientUid'] as String?)?.trim();
+    if (currentUid == null ||
+        currentUid.isEmpty ||
+        recipientUid == null ||
+        recipientUid != currentUid) {
+      return;
+    }
+
+    final title = (data['title'] as String?)?.trim();
+    final body = (data['body'] as String?)?.trim();
+    if (title?.isNotEmpty != true && body?.isNotEmpty != true) {
+      return;
+    }
+
+    await _showLocalNotification(
+      title: title?.isNotEmpty == true ? title! : 'แจ้งเตือน',
+      body: body ?? '',
+      payload: jsonEncode(<String, dynamic>{
+        'type': data['type'] ?? 'app_notification',
+        'notificationId': notificationId,
+        'orderId': data['orderId'],
+        'ticketId': data['ticketId'],
+        'action': data['action'],
+        'title': title,
+        'body': body,
+      }),
+    );
   }
 
   Future<bool> _ensureSystemNotificationPermission() async {
@@ -610,9 +676,9 @@ class NotificationService {
 
   /// บันทึก FCM token ของผู้ใช้ลง Firestore
   Future<void> saveUserFcmToken(String userId) async {
-    final token = await _firebaseMessaging
-        .getToken()
-        .timeout(const Duration(seconds: 8));
+    final token = await _firebaseMessaging.getToken().timeout(
+      const Duration(seconds: 8),
+    );
     if (token == null) return;
 
     try {
@@ -772,6 +838,7 @@ class NotificationService {
     required String body,
     String? payload,
   }) async {
+    debugPrint('Showing local notification: $title');
     const androidDetails = AndroidNotificationDetails(
       'order_channel',
       'การแจ้งเตือนออเดอร์',
@@ -1716,6 +1783,12 @@ class NotificationService {
     required UserProfile callee,
     required bool isVideo,
   }) async {
+    try {
+      await AppCheckGuard.ensureFinancialReady();
+    } catch (error) {
+      throw _CallStartException(_cleanExceptionMessage(error));
+    }
+
     const List<String> preferredRegions = <String>[
       'asia-southeast1',
       'us-central1',
@@ -1742,8 +1815,13 @@ class NotificationService {
         debugPrint(
           'Error initiating call via $region: ${e.code} - ${e.message}',
         );
+        if (_isAppCheckRequiredError(e)) {
+          throw const _CallStartException(
+            'ไม่สามารถยืนยันความปลอดภัยของอุปกรณ์ได้ กรุณาปิดแอปแล้วเปิดใหม่ หรืออัปเดตจาก TestFlight แล้วลองใหม่',
+          );
+        }
         if (e.code != 'not-found') {
-          rethrow;
+          throw _CallStartException(_callStartMessageForFunctionsError(e));
         }
       }
     }
@@ -1756,6 +1834,57 @@ class NotificationService {
       message: 'Unknown error initiating call',
     );
   }
+
+  static bool _isAppCheckRequiredError(FirebaseFunctionsException error) {
+    final text = [
+      error.code,
+      error.message,
+      error.details,
+    ].whereType<Object>().join(' ').toLowerCase();
+    return text.contains('app check') ||
+        text.contains('appcheck') ||
+        text.contains('verification required');
+  }
+
+  static String _cleanExceptionMessage(Object error) {
+    return error.toString().replaceFirst('Exception: ', '').trim();
+  }
+
+  static String _callStartMessageForFunctionsError(
+    FirebaseFunctionsException error,
+  ) {
+    final message = error.message ?? '';
+    final lower = message.toLowerCase();
+
+    if (error.code == 'failed-precondition') {
+      if (lower.contains('agora') ||
+          lower.contains('app_id') ||
+          lower.contains('certificate')) {
+        return 'ระบบโทรยังไม่ได้ตั้งค่า Agora Secret บน Cloud Functions ครบ ต้องตั้ง AGORA_APP_ID และ AGORA_APP_CERTIFICATE แล้ว deploy function initiateCall';
+      }
+      if (lower.contains('fcm') || lower.contains('token')) {
+        return 'เครื่องปลายทางยังไม่มีโทเคนแจ้งเตือน กรุณาเปิดแอปปลายทางและอนุญาตแจ้งเตือนก่อน';
+      }
+      return message.isNotEmpty ? message : 'ยังไม่สามารถเริ่มโทรได้ในตอนนี้';
+    }
+
+    if (error.code == 'internal') {
+      return 'Cloud Function สำหรับโทรยังผิดพลาดภายใน กรุณา deploy function initiateCall เวอร์ชันล่าสุดแล้วลองใหม่';
+    }
+
+    return message.isNotEmpty
+        ? message
+        : 'เริ่มการโทรไม่สำเร็จ (${error.code})';
+  }
+}
+
+class _CallStartException implements Exception {
+  const _CallStartException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }
 
 /// Background message handler (ต้องเป็น top-level function)

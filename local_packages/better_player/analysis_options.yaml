@@ -6,6 +6,9 @@ analyzer:
   exclude:
     - example/**
     - test/**
+    - build/**
+    - android/**
+    - ios/**
   errors:
     non_nullable_equals_parameter: ignore
     unreachable_switch_default: ignore

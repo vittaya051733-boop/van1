@@ -66,3 +66,9 @@ android/build/reports/
 **/.gradle/
 
 node_modules
+
+# Local secrets and key metadata (never commit)
+.local-secrets/
+
+# Local agent/deploy tools
+.tools/

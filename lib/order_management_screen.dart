@@ -7,10 +7,23 @@ class OrderManagementScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('จัดการออเดอร์'),
+        automaticallyImplyLeading: false,
+        title: const SizedBox.shrink(),
+        flexibleSpace: const SafeArea(
+          child: Center(
+            child: Text(
+              'จัดการออเดอร์',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 20),
+            ),
+          ),
+        ),
       ),
       body: const Center(
-        child: Text('ยังไม่มีออเดอร์ในขณะนี้', style: TextStyle(fontSize: 18, color: Colors.grey)),
+        child: Text(
+          'ยังไม่มีออเดอร์ในขณะนี้',
+          style: TextStyle(fontSize: 18, color: Colors.grey),
+        ),
       ),
     );
   }

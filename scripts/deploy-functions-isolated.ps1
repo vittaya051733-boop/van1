@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$importScript = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\van2\scripts\deploy-governance-import.ps1'))
+$importScript = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\van2\scripts\deploy-governance-import.ps1'))
 . $importScript -CallingScriptRoot $PSScriptRoot
 $deployScript = Join-Path $PSScriptRoot 'deploy-isolated.ps1'
 

@@ -15,7 +15,7 @@ class ProductAiImageCache {
   static final ProductAiImageCache instance = ProductAiImageCache._();
 
   static const String _keyPrefix = 'product_ai_image_cache_v1_';
-  static const int _maxEntries = 30;
+  static const int _maxEntries = 120;
   static const int _ahashHammingThreshold = 32;
 
   String _prefsKey(String ownerUid) => '$_keyPrefix$ownerUid';
@@ -60,6 +60,26 @@ class ProductAiImageCache {
     } catch (error) {
       debugPrint('ProductAiImageCache.save failed: $error');
     }
+  }
+
+  Future<ImageIdentity> identify(Uint8List imageBytes) async {
+    final fingerprint = await compute(_fingerprintImage, imageBytes);
+    return ImageIdentity(
+      sha256Hex: fingerprint.sha256Hex,
+      ahash: fingerprint.ahash,
+    );
+  }
+
+  static bool similarIdentity(ImageIdentity left, ImageIdentity right) {
+    if (left.sha256Hex.isNotEmpty && left.sha256Hex == right.sha256Hex) {
+      return true;
+    }
+    final leftHash = left.ahash;
+    final rightHash = right.ahash;
+    if (leftHash == null || rightHash == null) {
+      return false;
+    }
+    return _hamming(leftHash, rightHash) <= _ahashHammingThreshold;
   }
 
   Future<Map<String, dynamic>?> find({
@@ -119,10 +139,20 @@ class ProductAiImageCache {
     }
     return decoded
         .whereType<Map>()
-        .map((item) => _CachedAiImageEntry.fromJson(Map<String, dynamic>.from(item)))
+        .map(
+          (item) =>
+              _CachedAiImageEntry.fromJson(Map<String, dynamic>.from(item)),
+        )
         .where((entry) => entry.aiResult.isNotEmpty)
         .toList();
   }
+}
+
+class ImageIdentity {
+  const ImageIdentity({required this.sha256Hex, this.ahash});
+
+  final String sha256Hex;
+  final String? ahash;
 }
 
 class _ImageFingerprint {

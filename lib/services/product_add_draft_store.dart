@@ -17,8 +17,7 @@ class ProductAddDraftStore {
 
   String createDraftId(String ownerUid) {
     final millis = DateTime.now().millisecondsSinceEpoch;
-    return '${ownerUid}_$millis'
-        .replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    return '${ownerUid}_$millis'.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
   }
 
   Future<void> save(String ownerUid, Map<String, dynamic> draft) async {
@@ -50,6 +49,32 @@ class ProductAddDraftStore {
     if (ownerUid.isEmpty) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_prefsKey(ownerUid));
+  }
+
+  Future<String?> persistMediaBytes({
+    required List<int> bytes,
+    required String ownerUid,
+    required String draftId,
+    required String fileName,
+  }) async {
+    if (kIsWeb || bytes.isEmpty || ownerUid.isEmpty || draftId.isEmpty) {
+      return null;
+    }
+    try {
+      final docsDir = await getApplicationDocumentsDirectory();
+      final draftDir = Directory(
+        '${docsDir.path}/product_drafts/$ownerUid/$draftId',
+      );
+      if (!await draftDir.exists()) {
+        await draftDir.create(recursive: true);
+      }
+      final destination = File('${draftDir.path}/$fileName');
+      await destination.writeAsBytes(bytes, flush: true);
+      return destination.path;
+    } catch (error) {
+      debugPrint('ProductAddDraftStore.persistMediaBytes failed: $error');
+      return null;
+    }
   }
 
   Future<String?> persistMediaFile({

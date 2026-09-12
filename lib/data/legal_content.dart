@@ -21,7 +21,8 @@ class LegalContent {
     titleTh: 'นโยบายความเป็นส่วนตัว',
     titleEn: 'Privacy Policy',
     updatedAtLabel: '31 พ.ค. 2026',
-    bodyTh: '''แอป Van Market สำหรับร้านค้า (van1) เป็นส่วนหนึ่งของแพลตฟอร์ม VANTALAD
+    bodyTh:
+        '''แอป Van Market สำหรับร้านค้า (van1) เป็นส่วนหนึ่งของแพลตฟอร์ม VANTALAD
 
 ข้อมูลที่เราเก็บ
 • บัญชีร้านค้า (อีเมล, ชื่อ, รูปโปรไฟล์จาก Google)
@@ -39,7 +40,10 @@ class LegalContent {
 • เก็บตามระยะเวลาที่จำเป็นต่อบริการและข้อกำหนดทางกฎหมาย
 
 สิทธิของคุณ (PDPA)
-• ขอเข้าถึง แก้ไข หรือลบข้อมูล — ติดต่อแอดมินผ่านแอป
+• ขอเข้าถึงหรือแก้ไขข้อมูล — ติดต่อแอดมินผ่านแอป
+• ลบบัญชีได้จากเมนู ตั้งค่าและบัญชี → ลบบัญชีถาวร
+• หลังลบบัญชี ระบบจะลบบัญชีเข้าสู่ระบบ ปิดร้าน/สินค้า และลบข้อมูลส่วนตัวที่ไม่จำเป็น
+• ประวัติออเดอร์ กระเป๋าเงิน สัญญา และข้อมูลธุรกรรมที่จำเป็นอาจยังถูกเก็บไว้เพื่อบัญชี ภาษี ความปลอดภัย และข้อพิพาท
 
 ติดต่อ
 • ใช้เมนู ตั้งค่า → ติดต่อแอดมิน''',
@@ -61,7 +65,10 @@ Retention
 • Kept as long as needed for service and legal requirements
 
 Your rights (PDPA)
-• Request access, correction, or deletion via Contact admin
+• Request access or correction via Contact admin
+• Delete your account from Settings and account → Delete account permanently
+• Account deletion removes your sign-in account, hides your shop/products, and deletes personal data that is no longer required
+• Order history, wallet, contract, and transaction records may be retained as required for accounting, tax, safety, and dispute handling
 
 Contact
 • Settings → Contact admin''',

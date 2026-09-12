@@ -39,8 +39,11 @@ class ProductDraftService {
   Future<Map<String, dynamic>?> loadDraft({
     required String ownerUid,
     required String draftId,
+    Source source = Source.serverAndCache,
   }) async {
-    final snap = await draftRef(ownerUid, draftId).get();
+    final snap = await draftRef(ownerUid, draftId).get(
+      GetOptions(source: source),
+    );
     if (!snap.exists) {
       return null;
     }

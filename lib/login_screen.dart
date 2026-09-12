@@ -549,7 +549,7 @@ class _LoginHeader extends StatelessWidget {
         ),
         const SizedBox(height: 32),
         const Text(
-          'Van Merchant',
+          'แว๊นตลาดร้านค้า',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 28,

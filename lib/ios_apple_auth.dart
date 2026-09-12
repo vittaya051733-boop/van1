@@ -21,7 +21,7 @@ Future<UserCredential> signInWithAppleForIos() async {
       code: 'apple-auth-unavailable',
       message: isIosSimulator
           ? 'บน Simulator ให้เข้า Settings → Apple ID ลงชื่อเข้าใช้ก่อน\n'
-              'หรือทดสอบบน iPhone จริง'
+                'หรือทดสอบบน iPhone จริง'
           : 'อุปกรณ์นี้ยังไม่รองรับ Sign in with Apple',
     );
   }
@@ -31,24 +31,25 @@ Future<UserCredential> signInWithAppleForIos() async {
 
   try {
     debugPrint('🍎 Opening Apple Sign-In sheet...');
-    final appleCredential = await SignInWithApple.getAppleIDCredential(
-      scopes: <AppleIDAuthorizationScopes>[
-        AppleIDAuthorizationScopes.email,
-        AppleIDAuthorizationScopes.fullName,
-      ],
-      nonce: nonce,
-    ).timeout(
-      appleSheetTimeout,
-      onTimeout: () {
-        throw FirebaseAuthException(
-          code: 'apple-auth-timeout',
-          message: isIosSimulator
-              ? 'Apple Sign-In ใช้เวลานานเกินไป — ลองลงชื่อ Apple ID ใน Settings ก่อน '
-                  'หรือทดสอบบน iPhone จริง'
-              : 'Apple Sign-In ใช้เวลานานเกินไป กรุณาลองใหม่',
+    final appleCredential =
+        await SignInWithApple.getAppleIDCredential(
+          scopes: <AppleIDAuthorizationScopes>[
+            AppleIDAuthorizationScopes.email,
+            AppleIDAuthorizationScopes.fullName,
+          ],
+          nonce: nonce,
+        ).timeout(
+          appleSheetTimeout,
+          onTimeout: () {
+            throw FirebaseAuthException(
+              code: 'apple-auth-timeout',
+              message: isIosSimulator
+                  ? 'Apple Sign-In ใช้เวลานานเกินไป — ลองลงชื่อ Apple ID ใน Settings ก่อน '
+                        'หรือทดสอบบน iPhone จริง'
+                  : 'Apple Sign-In ใช้เวลานานเกินไป กรุณาลองใหม่',
+            );
+          },
         );
-      },
-    );
     debugPrint('🍎 Apple sheet completed — exchanging token with Firebase...');
 
     final identityToken = appleCredential.identityToken;
@@ -85,14 +86,49 @@ Future<UserCredential> signInWithAppleForIos() async {
 
     return userCredential;
   } on SignInWithAppleAuthorizationException catch (error) {
-    debugPrint(
-      'Apple authorization failed: ${error.code} ${error.message}',
-    );
+    debugPrint('Apple authorization failed: ${error.code} ${error.message}');
     throw toFirebaseAppleAuthException(error);
   } on FirebaseAuthException catch (error) {
     debugPrint('Firebase Apple sign-in failed: ${error.code} ${error.message}');
     rethrow;
   }
+}
+
+Future<String> requestAppleAuthorizationCodeForTokenRevocation() async {
+  const appleSheetTimeout = Duration(minutes: 3);
+
+  final isAvailable = await SignInWithApple.isAvailable();
+  if (!isAvailable) {
+    throw FirebaseAuthException(
+      code: 'apple-auth-unavailable',
+      message: isIosSimulator
+          ? 'บน Simulator ให้เข้า Settings → Apple ID ลงชื่อเข้าใช้ก่อน\n'
+                'หรือทดสอบบน iPhone จริง'
+          : 'อุปกรณ์นี้ยังไม่รองรับ Sign in with Apple',
+    );
+  }
+
+  final appleCredential =
+      await SignInWithApple.getAppleIDCredential(
+        scopes: const <AppleIDAuthorizationScopes>[],
+      ).timeout(
+        appleSheetTimeout,
+        onTimeout: () {
+          throw FirebaseAuthException(
+            code: 'apple-auth-timeout',
+            message: 'Apple Sign-In ใช้เวลานานเกินไป กรุณาลองใหม่',
+          );
+        },
+      );
+
+  final authorizationCode = appleCredential.authorizationCode.trim();
+  if (authorizationCode.isEmpty) {
+    throw FirebaseAuthException(
+      code: 'missing-authorization-code',
+      message: 'ไม่พบรหัสยืนยันจาก Apple สำหรับยกเลิกสิทธิ์บัญชี',
+    );
+  }
+  return authorizationCode;
 }
 
 Future<UserCredential> _exchangeAppleCredentialWithFirebase({
@@ -119,22 +155,26 @@ Future<UserCredential> _exchangeAppleCredentialWithFirebase({
       rawNonce: rawNonce,
       accessToken: includeAuthCode ? authorizationCode : null,
     );
-    return FirebaseAuth.instance.signInWithCredential(credential).timeout(
-      firebaseAuthTimeout,
-      onTimeout: () {
-        throw FirebaseAuthException(
-          code: 'apple-auth-timeout',
-          message: 'ยืนยัน Apple กับ Firebase ใช้เวลานานเกินไป — '
-              'ตรวจสอบเน็ตและ App Check debug token',
+    return FirebaseAuth.instance
+        .signInWithCredential(credential)
+        .timeout(
+          firebaseAuthTimeout,
+          onTimeout: () {
+            throw FirebaseAuthException(
+              code: 'apple-auth-timeout',
+              message:
+                  'ยืนยัน Apple กับ Firebase ใช้เวลานานเกินไป — '
+                  'ตรวจสอบเน็ตและ App Check debug token',
+            );
+          },
         );
-      },
-    );
   }
 
   try {
     return await attempt(includeAuthCode: false);
   } on FirebaseAuthException catch (error) {
-    final canRetry = (error.code == 'invalid-credential' ||
+    final canRetry =
+        (error.code == 'invalid-credential' ||
             error.code == 'auth/invalid-credential') &&
         authorizationCode != null &&
         authorizationCode.isNotEmpty;

@@ -94,6 +94,12 @@ async function resolveAnyRecipientFcmToken(recipientUid) {
 async function resolveCallRecipientFcmToken(recipientUid) {
   if (!recipientUid) return null;
 
+  try {
+    const userDoc = await db.collection('users').doc(recipientUid).get();
+    const token = String(userDoc.data()?.fcmToken || '').trim();
+    if (token) return token;
+  } catch (_) {}
+
   for (const collection of SHOP_COLLECTIONS) {
     try {
       const doc = await db.collection(collection).doc(recipientUid).get();
@@ -119,6 +125,47 @@ async function resolveCallRecipientFcmToken(recipientUid) {
   }
 
   return null;
+}
+
+function isUnregisteredFcmTokenError(error) {
+  const text = [
+    error?.code,
+    error?.errorInfo?.code,
+    error?.message,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return text.includes('notregistered') ||
+    text.includes('registration-token-not-registered') ||
+    text.includes('requested entity was not found');
+}
+
+async function clearInvalidRecipientFcmToken(recipientUid, invalidToken) {
+  if (!recipientUid || !invalidToken) return;
+
+  const targets = [
+    { collection: 'users', field: 'fcmToken' },
+    ...SHOP_COLLECTIONS.map((collection) => ({ collection, field: 'shopFCMToken' })),
+    ...RIDER_COLLECTIONS.map((collection) => ({ collection, field: 'fcmToken' })),
+    ...CUSTOMER_COLLECTIONS.map((collection) => ({ collection, field: 'fcmToken' })),
+  ];
+
+  await Promise.all(targets.map(async ({ collection, field }) => {
+    try {
+      const ref = db.collection(collection).doc(recipientUid);
+      const snap = await ref.get();
+      const token = String(snap.data()?.[field] || '').trim();
+      if (token === invalidToken) {
+        await ref.set({ [field]: FieldValue.delete() }, { merge: true });
+        console.warn('[fcm] cleared invalid recipient token', { recipientUid, collection, field });
+      }
+    } catch (error) {
+      console.warn('[fcm] failed to clear invalid token', {
+        recipientUid,
+        collection,
+        field,
+        message: error?.message,
+      });
+    }
+  }));
 }
 
 async function _sendChatNotification({
@@ -257,6 +304,15 @@ const AI_QUEUE_AVERAGE_SECONDS = 45;
 const AI_QUEUE_POLL_MS = 2500;
 const AI_QUEUE_MAX_WAIT_MS = 60 * 1000;
 const AI_QUEUE_JOB_TTL_MS = 4 * 60 * 1000;
+const PRODUCT_AI_WORKER_MAX_JOBS = 2;
+const PRODUCT_AI_WORKER_MAX_PER_OWNER = 1;
+const PRODUCT_AI_BULK_MAX_ITEMS = 300;
+const PRODUCT_AI_PRIORITY_INTERACTIVE = 1000;
+const PRODUCT_AI_PRIORITY_BULK = 0;
+const PRODUCT_AI_PRIORITY_BULK_RETRY = 5;
+const PRODUCT_AI_BACKGROUND_DEFER_MS = 2 * 60 * 1000;
+const PRODUCT_AI_INTERACTIVE_QUEUE_TTL_MS = 15 * 60 * 1000;
+const PRODUCT_AI_WORKER_KICK_MAX_ROUNDS = 8;
 const AI_BACKGROUND_DEFAULT_PATH = 'gs://van-merchant.firebasestorage.app/image_background';
 const AI_BACKGROUND_MAX_BYTES = 5 * 1024 * 1024;
 const AI_BACKGROUND_MAX_CANDIDATES = 10;
@@ -450,7 +506,36 @@ function formatExternalAiRecommendation(queuePosition, estimatedWaitSeconds) {
   return `คิว AI ตอนนี้เยอะมาก (คิวที่ ${queuePosition}, ประมาณ ${minutes} นาที) หากต้องการลงสินค้าเร็ว แนะนำใช้ AI ภายนอกลบ/เปลี่ยนพื้นหลังเป็นสีขาวก่อน แล้วค่อยอัปโหลดรูปเข้าระบบ หรือรอสักครู่แล้วลองใหม่`;
 }
 
-async function acquireAiProcessingSlot({ uid, requestId }) {
+async function mirrorProductAiJobQueueStatus(productAiJobRef, patch) {
+  if (!productAiJobRef) return;
+  try {
+    await productAiJobRef.set({
+      ...patch,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (error) {
+    logger.warn('mirrorProductAiJobQueueStatus failed', {
+      jobId: productAiJobRef.id,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function productAiJobCreatedAtMillis(data) {
+  const createdAt = data?.createdAt;
+  if (createdAt && typeof createdAt.toMillis === 'function') {
+    return createdAt.toMillis();
+  }
+  return Number(data?.nextRunAt || 0) || 0;
+}
+
+async function acquireAiProcessingSlot({
+  uid,
+  requestId,
+  allowLargeQueue = false,
+  maxWaitMs = AI_QUEUE_MAX_WAIT_MS,
+  productAiJobRef = null,
+}) {
   const jobId = normalizeAiRequestId(requestId);
   const jobRef = db.collection(AI_QUEUE_COLLECTION).doc(jobId);
   const createdAtMillis = Date.now();
@@ -466,7 +551,7 @@ async function acquireAiProcessingSlot({ uid, requestId }) {
     expiresAtMillis: createdAtMillis + AI_QUEUE_JOB_TTL_MS,
   }, { merge: true });
 
-  while (Date.now() - createdAtMillis < AI_QUEUE_MAX_WAIT_MS) {
+  while (Date.now() - createdAtMillis < maxWaitMs) {
     const now = Date.now();
     const snapshot = await db.collection(AI_QUEUE_COLLECTION)
       .where('expiresAtMillis', '>', now)
@@ -486,7 +571,7 @@ async function acquireAiProcessingSlot({ uid, requestId }) {
     const queuePosition = currentIndex >= 0 ? currentIndex + 1 : jobs.length + 1;
     const estimatedWaitSeconds = Math.max(10, Math.ceil((queuePosition - 1) * AI_QUEUE_AVERAGE_SECONDS));
 
-    if (queuePosition > AI_QUEUE_MAX_VISIBLE_POSITION) {
+    if (!allowLargeQueue && queuePosition > AI_QUEUE_MAX_VISIBLE_POSITION) {
       const message = formatExternalAiRecommendation(queuePosition, estimatedWaitSeconds);
       await jobRef.set({
         uid,
@@ -506,26 +591,37 @@ async function acquireAiProcessingSlot({ uid, requestId }) {
       });
     }
 
+    const reachedProcessingSlot = currentIndex >= 0 && currentIndex < AI_QUEUE_MAX_CONCURRENT;
+    const queueMessage = reachedProcessingSlot
+      ? 'ถึงคิวแล้ว กำลังประมวลผล AI'
+      : `กำลังรอคิว AI ลำดับที่ ${queuePosition}`;
+
     await jobRef.set({
-      status: currentIndex >= 0 && currentIndex < AI_QUEUE_MAX_CONCURRENT ? 'processing' : 'queued',
+      status: reachedProcessingSlot ? 'processing' : 'queued',
       position: queuePosition,
       estimatedWaitSeconds,
       activeProcessing,
-      message: currentIndex >= 0 && currentIndex < AI_QUEUE_MAX_CONCURRENT
-        ? 'ถึงคิวแล้ว กำลังประมวลผล AI'
-        : `กำลังรอคิว AI ลำดับที่ ${queuePosition}`,
+      message: queueMessage,
       updatedAt: FieldValue.serverTimestamp(),
       expiresAtMillis: now + AI_QUEUE_JOB_TTL_MS,
     }, { merge: true });
 
-    if (currentIndex >= 0 && currentIndex < AI_QUEUE_MAX_CONCURRENT) {
+    await mirrorProductAiJobQueueStatus(productAiJobRef, {
+      status: reachedProcessingSlot ? 'processing' : 'queued',
+      position: queuePosition,
+      queuePosition,
+      estimatedWaitSeconds,
+      message: queueMessage,
+    });
+
+    if (reachedProcessingSlot) {
       return { jobRef, position: queuePosition, estimatedWaitSeconds };
     }
 
     await sleep(AI_QUEUE_POLL_MS);
   }
 
-  const message = formatExternalAiRecommendation(AI_QUEUE_MAX_VISIBLE_POSITION, AI_QUEUE_MAX_WAIT_MS / 1000);
+  const message = formatExternalAiRecommendation(AI_QUEUE_MAX_VISIBLE_POSITION, maxWaitMs / 1000);
   await jobRef.set({
     status: 'rejected',
     message,
@@ -534,7 +630,7 @@ async function acquireAiProcessingSlot({ uid, requestId }) {
     expiresAtMillis: Date.now() + AI_QUEUE_JOB_TTL_MS,
   }, { merge: true });
   throw new HttpsError('deadline-exceeded', message, {
-    estimatedWaitSeconds: AI_QUEUE_MAX_WAIT_MS / 1000,
+    estimatedWaitSeconds: maxWaitMs / 1000,
     externalAiRecommended: true,
   });
 }
@@ -605,6 +701,323 @@ function parseNumber(value) {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+}
+
+const MERCHANT_ACTIVE_ORDER_STATUSES = [
+  'pending',
+  'accepted',
+  'awaiting_shop_confirmation',
+  'awaiting_shipping_booking',
+  'preparing',
+  'ready',
+  'delivering',
+];
+
+const PENDING_WITHDRAW_STATUSES = new Set([
+  'pending',
+  'approved',
+  'processing',
+  'transferring',
+]);
+
+exports.deleteMerchantAccount = functions
+  .region(DEFAULT_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'กรุณาเข้าสู่ระบบก่อนลบบัญชี',
+      );
+    }
+
+    const dryRun = data?.dryRun === true;
+    const blockedReason = await getMerchantDeletionBlockedReason(uid);
+    if (blockedReason) {
+      if (!dryRun) {
+        await db.collection('account_deletion_requests').doc(uid).set({
+          uid,
+          targetApp: 'van1',
+          status: 'blocked',
+          reason: blockedReason.code,
+          message: blockedReason.message,
+          updatedAt: FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        blockedReason.message,
+        { reason: blockedReason.code },
+      );
+    }
+
+    if (dryRun) {
+      return { canDelete: true };
+    }
+
+    await db.collection('account_deletion_requests').doc(uid).set({
+      uid,
+      targetApp: 'van1',
+      status: 'processing',
+      requestedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    await Promise.all([
+      deleteDocumentTreeIfExists(db.collection('users').doc(uid)),
+      deleteDocumentTreeIfExists(db.collection('product_drafts').doc(uid)),
+      deleteDocumentTreeIfExists(db.collection('shop_operations').doc(uid)),
+      anonymizeMerchantRegistrationDocs(uid),
+      hideMerchantPublicShop(uid),
+      hideMerchantProducts(uid),
+      markRetainedMerchantOrders(uid),
+      deleteQueryInBatches(
+        db.collection('app_notifications').where('recipientUid', '==', uid),
+      ),
+      deleteQueryInBatches(
+        db.collection('active_call_invites').where('callerId', '==', uid),
+      ),
+      deleteQueryInBatches(
+        db.collection('active_call_invites').where('calleeId', '==', uid),
+      ),
+    ]);
+
+    try {
+      await admin.auth().deleteUser(uid);
+    } catch (error) {
+      if (error?.code !== 'auth/user-not-found') {
+        await db.collection('account_deletion_requests').doc(uid).set({
+          status: 'auth_delete_failed',
+          errorCode: error?.code || null,
+          errorMessage: error?.message || String(error),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        throw new functions.https.HttpsError(
+          'internal',
+          'ลบบัญชีเข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่',
+        );
+      }
+    }
+
+    await db.collection('account_deletion_requests').doc(uid).set({
+      status: 'completed',
+      completedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      retainedRecords: ['orders', 'merchant_wallets', 'contracts'],
+    }, { merge: true });
+
+    return {
+      deleted: true,
+      deletedAt: new Date().toISOString(),
+      retainedRecords: ['orders', 'merchant_wallets', 'contracts'],
+    };
+  });
+
+async function getMerchantDeletionBlockedReason(uid) {
+  const activeOrder = await findActiveMerchantOrder(uid);
+  if (activeOrder) {
+    return {
+      code: 'active_orders',
+      message: 'ยังมีออเดอร์ที่กำลังดำเนินการอยู่ กรุณาปิดงานให้เรียบร้อยก่อนลบบัญชี',
+    };
+  }
+
+  const pendingWithdraw = await findPendingWithdrawRequest(uid);
+  if (pendingWithdraw) {
+    return {
+      code: 'pending_withdraw',
+      message: 'ยังมีรายการถอนเงินที่รอดำเนินการ กรุณารอให้เสร็จสิ้นก่อนลบบัญชี',
+    };
+  }
+
+  const wallet = await db.collection('merchant_wallets').doc(uid).get();
+  if (wallet.exists && walletHasOutstandingBalance(wallet.data() || {})) {
+    return {
+      code: 'outstanding_balance',
+      message: 'ยังมียอดเงินหรือเงินประกันในบัญชี กรุณาถอนเงินหรือให้แอดมินเคลียร์ยอดก่อนลบบัญชี',
+    };
+  }
+
+  return null;
+}
+
+async function findActiveMerchantOrder(uid) {
+  const queries = [
+    db.collection('orders')
+      .where('shopId', '==', uid)
+      .where('status', 'in', MERCHANT_ACTIVE_ORDER_STATUSES)
+      .limit(1),
+    db.collection('orders')
+      .where('shopOwnerId', '==', uid)
+      .where('status', 'in', MERCHANT_ACTIVE_ORDER_STATUSES)
+      .limit(1),
+  ];
+
+  for (const query of queries) {
+    const snapshot = await query.get();
+    if (!snapshot.empty) {
+      return snapshot.docs[0];
+    }
+  }
+  return null;
+}
+
+async function findPendingWithdrawRequest(uid) {
+  const snapshot = await db.collection('withdraw_requests')
+    .where('uid', '==', uid)
+    .limit(25)
+    .get();
+  return snapshot.docs.find((doc) => {
+    const status = String(doc.data()?.status || '').trim().toLowerCase();
+    return PENDING_WITHDRAW_STATUSES.has(status);
+  });
+}
+
+function walletHasOutstandingBalance(data) {
+  return [
+    'totalCredit',
+    'withdrawableCredit',
+    'lockedCredit',
+    'omisePendingCredit',
+    'omiseWithdrawableCredit',
+    'securityDepositAmount',
+  ].some((field) => parseNumber(data[field]) > 0.009);
+}
+
+async function deleteDocumentTreeIfExists(ref) {
+  const snapshot = await ref.get();
+  if (!snapshot.exists) {
+    return;
+  }
+  await db.recursiveDelete(ref);
+}
+
+async function anonymizeMerchantRegistrationDocs(uid) {
+  const refs = new Map();
+  for (const collection of SHOP_COLLECTIONS) {
+    const directRef = db.collection(collection).doc(uid);
+    const directDoc = await directRef.get();
+    if (directDoc.exists) {
+      refs.set(directRef.path, directRef);
+    }
+
+    const ownerSnapshot = await db.collection(collection)
+      .where('ownerId', '==', uid)
+      .limit(25)
+      .get();
+    ownerSnapshot.docs.forEach((doc) => refs.set(doc.ref.path, doc.ref));
+  }
+
+  const update = {
+    accountDeleted: true,
+    accountDeletedAt: FieldValue.serverTimestamp(),
+    status: 'account_deleted',
+    isDeleted: true,
+    isOpen: false,
+    fcmToken: FieldValue.delete(),
+    shopFCMToken: FieldValue.delete(),
+    email: FieldValue.delete(),
+    phone: FieldValue.delete(),
+    phoneNumber: FieldValue.delete(),
+    contactName: FieldValue.delete(),
+    displayName: FieldValue.delete(),
+    ownerName: FieldValue.delete(),
+    bookBankImageUrl: FieldValue.delete(),
+    bankAccountName: FieldValue.delete(),
+    bankAccountNumber: FieldValue.delete(),
+  };
+
+  await updateRefsInBatches([...refs.values()], update);
+}
+
+async function hideMerchantPublicShop(uid) {
+  const ref = db.collection('public_shops').doc(uid);
+  const snapshot = await ref.get();
+  if (!snapshot.exists) {
+    return;
+  }
+
+  await ref.set({
+    accountDeleted: true,
+    accountDeletedAt: FieldValue.serverTimestamp(),
+    active: false,
+    isActive: false,
+    isDeleted: true,
+    isOpen: false,
+    visible: false,
+    hidden: true,
+    shopName: 'ร้านค้าที่ลบบัญชีแล้ว',
+    displayName: 'ร้านค้าที่ลบบัญชีแล้ว',
+    name: 'ร้านค้าที่ลบบัญชีแล้ว',
+    phone: FieldValue.delete(),
+    phoneNumber: FieldValue.delete(),
+    email: FieldValue.delete(),
+    imageUrl: FieldValue.delete(),
+    logoUrl: FieldValue.delete(),
+    photoUrl: FieldValue.delete(),
+    searchKeywords: [],
+  }, { merge: true });
+}
+
+async function hideMerchantProducts(uid) {
+  const refs = new Map();
+  const queries = [
+    db.collection('products').where('ownerUid', '==', uid).limit(500),
+    db.collection('products').where('ownerId', '==', uid).limit(500),
+  ];
+
+  for (const query of queries) {
+    const snapshot = await query.get();
+    snapshot.docs.forEach((doc) => refs.set(doc.ref.path, doc.ref));
+  }
+
+  await updateRefsInBatches([...refs.values()], {
+    accountDeleted: true,
+    ownerAccountDeleted: true,
+    accountDeletedAt: FieldValue.serverTimestamp(),
+    active: false,
+    isActive: false,
+    available: false,
+    visible: false,
+    isDeleted: true,
+  });
+}
+
+async function markRetainedMerchantOrders(uid) {
+  const refs = new Map();
+  const queries = [
+    db.collection('orders').where('shopId', '==', uid).limit(500),
+    db.collection('orders').where('shopOwnerId', '==', uid).limit(500),
+  ];
+
+  for (const query of queries) {
+    const snapshot = await query.get();
+    snapshot.docs.forEach((doc) => refs.set(doc.ref.path, doc.ref));
+  }
+
+  await updateRefsInBatches([...refs.values()], {
+    merchantAccountDeleted: true,
+    merchantAccountDeletedAt: FieldValue.serverTimestamp(),
+  });
+}
+
+async function updateRefsInBatches(refs, update) {
+  for (let index = 0; index < refs.length; index += 400) {
+    const batch = db.batch();
+    refs.slice(index, index + 400).forEach((ref) => batch.set(ref, update, { merge: true }));
+    await batch.commit();
+  }
+}
+
+async function deleteQueryInBatches(query) {
+  let snapshot = await query.limit(400).get();
+  while (!snapshot.empty) {
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    snapshot = await query.limit(400).get();
+  }
 }
 
 function amountsMatch(actualAmount, expectedAmount) {
@@ -1667,13 +2080,16 @@ exports.askGeminiFlash = onCall(
 );
 
 const GEMINI_API_VERSIONS = ['v1beta', 'v1'];
-const GEMINI_PREFERRED_MODELS = [
+const GEMINI_PRO_ESCALATION_CONFIDENCE = 65;
+const GEMINI_PRO_MODELS = [
   'gemini-2.5-pro',
+];
+const GEMINI_PREFERRED_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-1.5-flash',
 ];
-const AI_CATALOG_CLASSIFIER_VERSION = 'v7';
+const AI_CATALOG_CLASSIFIER_VERSION = 'v9';
 const CATALOG_AI_CACHE_COLLECTION = 'catalog_ai_cache';
 const PRODUCT_AI_CACHE_COLLECTION = 'product_ai_cache';
 const AI_CONFIDENCE_THRESHOLD = 80;
@@ -1723,6 +2139,44 @@ function parseJsonFromGeminiParts(parts) {
   return {};
 }
 
+function uniqueValues(values) {
+  return [...new Set(values.filter((value) => String(value || '').trim()))];
+}
+
+function isGeminiProModel(modelName) {
+  return /(^|-)pro($|-)/i.test(String(modelName || ''));
+}
+
+function buildGeminiModelPasses(discoveredModelNames, preferredModels = GEMINI_PREFERRED_MODELS) {
+  const discovered = [...discoveredModelNames]
+    .map((name) => String(name || '').trim())
+    .filter((name) => name && !/image|imagen/i.test(name));
+  return {
+    flashModels: uniqueValues([
+      ...preferredModels.filter((name) => !isGeminiProModel(name)),
+      ...discovered.filter((name) => !isGeminiProModel(name)),
+    ]),
+    proModels: uniqueValues([
+      ...GEMINI_PRO_MODELS,
+      ...discovered.filter(isGeminiProModel),
+    ]),
+  };
+}
+
+function lowestAiConfidence(analysis) {
+  const scores = Object.entries(analysis || {})
+    .filter(([key]) => key.endsWith('Confidence'))
+    .map(([, value]) => Number(value))
+    .filter(Number.isFinite);
+  if (scores.length === 0) return null;
+  return Math.min(...scores);
+}
+
+function shouldEscalateAiAnalysisToPro(analysis) {
+  const lowest = lowestAiConfidence(analysis);
+  return lowest != null && lowest < GEMINI_PRO_ESCALATION_CONFIDENCE;
+}
+
 async function discoverGeminiModelNames(apiKey) {
   const discovered = new Set();
   for (const apiVersion of GEMINI_API_VERSIONS) {
@@ -1761,11 +2215,12 @@ async function runGeminiJsonPrompt({
   temperature = 0.1,
 }) {
   const discoveredModelNames = await discoverGeminiModelNames(apiKey);
-  const modelCandidates = [...new Set([...GEMINI_PREFERRED_MODELS, ...discoveredModelNames])];
+  const { flashModels, proModels } = buildGeminiModelPasses(discoveredModelNames);
   let lastErrorStatus = null;
   let lastErrorBody = '';
 
-  for (const modelName of modelCandidates) {
+  async function tryModelCandidates(modelCandidates) {
+    for (const modelName of modelCandidates) {
     for (const apiVersion of GEMINI_API_VERSIONS) {
       const endpoint = `https://generativelanguage.googleapis.com/${apiVersion}/models/${modelName}:generateContent`;
       const parts = [{ text: prompt }];
@@ -1833,6 +2288,23 @@ async function runGeminiJsonPrompt({
       lastErrorBody = JSON.stringify(payload).slice(0, 1000);
     }
   }
+    return null;
+  }
+
+  const flashResult = await tryModelCandidates(flashModels);
+  if (flashResult) {
+    if (!shouldEscalateAiAnalysisToPro(flashResult.analysis)) {
+      return flashResult;
+    }
+    const proResult = await tryModelCandidates(proModels);
+    if (proResult) {
+      return {
+        ...proResult,
+        model: `${proResult.model} escalatedFrom=${flashResult.model}`,
+      };
+    }
+    return flashResult;
+  }
 
   logger.error('runGeminiJsonPrompt no available model', {
     ...logContext,
@@ -1895,28 +2367,18 @@ async function fetchImageAsInlineData(imageUrl) {
 
 function resolveCatalogTypeFromProduct(product) {
   const type = String(product?.aiProductType || product?.productType || '').trim();
-  const source = [
-    type,
+  const semanticSource = [
     String(product?.name || '').trim(),
     String(product?.description || '').trim(),
   ].join(' ').toLowerCase();
 
-  if (resolvePharmacyCatalogHeadingFromSource(source)) return 'ยาและเวชภัณฑ์';
-  const marketClassification = resolveMarketCatalogClassification(source);
+  // Known product semantics win over stale AI/category fields.
+  const marketClassification = resolveMarketCatalogClassification(semanticSource);
   if (marketClassification) return marketClassification.catalogType;
+  if (resolvePharmacyCatalogHeadingFromSource(semanticSource)) return 'ยาและเวชภัณฑ์';
 
-  if (/ผลไม้|fruit/.test(source)) return 'ผลไม้';
-  if (/ผัก|vegetable|ผักสด/.test(source)) return 'ผักสด';
-  const isSeafood = /ปลา|กุ้ง|ปู|หอย|ปลาหมึก|ทะเล|seafood|fish|shrimp|crab|squid|shellfish/.test(source);
-  const isDriedOrProcessed = /อาหารทะเลแปรรูป|แปรรูป|ของแห้ง|แห้ง|อบแห้ง|ตากแห้ง|แดดเดียว|เค็ม|รมควัน|ถนอมอาหาร|processed|dried|dry|smoked|salted/.test(source);
-  if (isSeafood && isDriedOrProcessed) return 'อาหารทะเลแปรรูป';
-  if (isDriedOrProcessed) return 'ของแห้ง / วัตถุดิบ';
-  if (/เนื้อ|หมู|ไก่|ปลา|กุ้ง|ปู|หอย|ทะเล|seafood|meat|chicken|pork|beef|fish/.test(source)) {
-    return 'เนื้อสัตว์';
-  }
-  if (/เครื่องดื่ม|น้ำ|ชา|กาแฟ|beverage|drink/.test(source)) return 'เครื่องดื่ม';
-  if (/อาหาร|ข้าว|แกง|ผัด|ทอด|ต้ม|ยำ|พร้อมทาน|prepared|cooked/.test(source)) return 'อาหารพร้อมทาน';
-  if (/ยา|เวชภัณฑ์|pharmacy|medicine|drug/.test(source)) return 'ยาและเวชภัณฑ์';
+  const catalogType = String(product?.catalogType || '').trim();
+  if (catalogType) return catalogType;
 
   const category = String(product?.productCategory || '').trim();
   return type || category || 'อื่นๆ';
@@ -2063,9 +2525,7 @@ function resolvePharmacyCatalogHeadingFromSource(source) {
 }
 
 function resolveRuleBasedCatalogClassification(product, serviceType = '') {
-  const type = String(product?.aiProductType || product?.productType || '').trim();
   const source = [
-    type,
     String(product?.name || '').trim(),
     String(product?.description || '').trim(),
   ].join(' ').toLowerCase();
@@ -2407,7 +2867,7 @@ async function resolveProductCatalogClassification({
   };
 }
 
-const PRODUCT_AI_ANALYSIS_VERSION = 3;
+const PRODUCT_AI_ANALYSIS_VERSION = 4;
 
 const STANDARD_SALE_UNITS = ['ชิ้น', 'ถุง', 'แพ็ค', 'มัด', 'ลูก', 'กล่อง'];
 
@@ -3245,8 +3705,29 @@ exports.analyzeProductWithAi = onCall(
         throw new HttpsError('unimplemented', 'โมเดล AI สำหรับวิเคราะห์สินค้ายังไม่พร้อมใช้งานในโปรเจกต์นี้');
       }
 
+      let resultModel = `${selectedModel}@${selectedApiVersion || 'unknown'}`;
+      if (!isGeminiProModel(selectedModel) && shouldEscalateAiAnalysisToPro(analysis)) {
+        const escalated = await runGeminiProductAnalysis({
+          uid: request.auth.uid,
+          apiKey,
+          imageBase64,
+          mimeType,
+          productName,
+          description,
+          category,
+          unit,
+          price,
+          weight,
+          weightUnit,
+        });
+        if (String(escalated.model || '').includes('escalatedFrom=')) {
+          analysis = escalated.analysis;
+          resultModel = escalated.model;
+        }
+      }
+
       const result = buildProductAiCallableResult(analysis, {
-        model: `${selectedModel}@${selectedApiVersion || 'unknown'}`,
+        model: resultModel,
         queuePosition: queueLease.position,
         estimatedWaitSeconds: queueLease.estimatedWaitSeconds,
       });
@@ -3324,11 +3805,7 @@ async function runGeminiProductAnalysis({
   weightUnit,
 }) {
   const apiVersions = ['v1beta', 'v1'];
-  const preferredModels = [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
-  ];
+  const preferredModels = GEMINI_PREFERRED_MODELS;
   const prompt = buildProductAiGeminiPrompt({
     productName,
     description,
@@ -3367,15 +3844,16 @@ async function runGeminiProductAnalysis({
     }
   }
 
-  const modelCandidates = [...new Set([...preferredModels, ...discoveredModelNames])];
-  let analysis = {};
-  let selectedModel = null;
-  let selectedApiVersion = null;
+  const { flashModels, proModels } = buildGeminiModelPasses(discoveredModelNames, preferredModels);
   let lastErrorStatus = null;
   let lastErrorBody = '';
 
-  for (const modelName of modelCandidates) {
-    for (const apiVersion of apiVersions) {
+  async function tryProductModelCandidates(modelCandidates) {
+    let analysis = {};
+    let selectedModel = null;
+    let selectedApiVersion = null;
+    for (const modelName of modelCandidates) {
+      for (const apiVersion of apiVersions) {
       const endpoint = `https://generativelanguage.googleapis.com/${apiVersion}/models/${modelName}:generateContent`;
       let response;
       try {
@@ -3461,10 +3939,35 @@ async function runGeminiProductAnalysis({
       lastErrorStatus = 200;
       lastErrorBody = JSON.stringify(payload).slice(0, 1000);
     }
-    if (selectedModel) break;
+      if (selectedModel) break;
+    }
+
+    if (!selectedModel) {
+      return null;
+    }
+
+    return {
+      analysis,
+      model: `${selectedModel}@${selectedApiVersion || 'unknown'}`,
+    };
   }
 
-  if (!selectedModel) {
+  const flashResult = await tryProductModelCandidates(flashModels);
+  if (flashResult) {
+    if (!shouldEscalateAiAnalysisToPro(flashResult.analysis)) {
+      return flashResult;
+    }
+    const proResult = await tryProductModelCandidates(proModels);
+    if (proResult) {
+      return {
+        analysis: proResult.analysis,
+        model: `${proResult.model} escalatedFrom=${flashResult.model}`,
+      };
+    }
+    return flashResult;
+  }
+
+  {
     logger.error('runGeminiProductAnalysis no available model', {
       uid,
       lastErrorStatus,
@@ -3473,11 +3976,6 @@ async function runGeminiProductAnalysis({
     });
     throw new HttpsError('unimplemented', 'โมเดล AI สำหรับวิเคราะห์สินค้ายังไม่พร้อมใช้งานในโปรเจกต์นี้');
   }
-
-  return {
-    analysis,
-    model: `${selectedModel}@${selectedApiVersion || 'unknown'}`,
-  };
 }
 
 async function notifyProductAiReady({ uid, draftId, jobId, productName }) {
@@ -3533,6 +4031,7 @@ async function processProductAiJob(jobId, jobData, apiKey) {
   const uid = String(jobData?.uid || '').trim();
   const draftId = String(jobData?.draftId || '').trim();
   const imageUrl = String(jobData?.imageUrl || '').trim();
+  const jobType = String(jobData?.jobType || 'interactive').trim();
   if (!uid || !draftId || !imageUrl) {
     throw new Error('product_ai_jobs missing uid/draftId/imageUrl');
   }
@@ -3549,6 +4048,7 @@ async function processProductAiJob(jobId, jobData, apiKey) {
   await draftRef.set({
     aiStatus: 'processing',
     aiRequestId: jobId,
+    aiStartedAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
@@ -3582,34 +4082,25 @@ async function processProductAiJob(jobId, jobData, apiKey) {
       fromCache: true,
     });
   } else {
-    const queueLease = await acquireAiProcessingSlot({ uid, requestId: jobId });
-    let queueFinalStatus = 'completed';
-    try {
-      const gemini = await runGeminiProductAnalysis({
-        uid,
-        apiKey,
-        imageBase64: inlineImage.data,
-        mimeType: inlineImage.mimeType,
-        productName,
-        description,
-        category,
-        unit,
-        price,
-        weight,
-        weightUnit,
-      });
-      result = buildProductAiCallableResult(gemini.analysis, {
-        model: gemini.model,
-        queuePosition: queueLease.position,
-        estimatedWaitSeconds: queueLease.estimatedWaitSeconds,
-      });
-      await saveProductAiCache(analysisInputHash, result, result.model);
-    } catch (error) {
-      queueFinalStatus = 'failed';
-      throw error;
-    } finally {
-      await releaseAiProcessingSlot(queueLease, queueFinalStatus);
-    }
+    const gemini = await runGeminiProductAnalysis({
+      uid,
+      apiKey,
+      imageBase64: inlineImage.data,
+      mimeType: inlineImage.mimeType,
+      productName,
+      description,
+      category,
+      unit,
+      price,
+      weight,
+      weightUnit,
+    });
+    result = buildProductAiCallableResult(gemini.analysis, {
+      model: gemini.model,
+      queuePosition: 1,
+      estimatedWaitSeconds: 0,
+    });
+    await saveProductAiCache(analysisInputHash, result, result.model);
   }
 
   await draftRef.set({
@@ -3618,14 +4109,29 @@ async function processProductAiJob(jobId, jobData, apiKey) {
     aiResult: result,
     imageUrl,
     thumbnailUrl: String(jobData?.thumbnailUrl || '').trim() || null,
+    reviewStatus: result.requiresAdminReview ? 'required' : 'ready',
+    aiCompletedAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
   await db.collection('product_ai_jobs').doc(jobId).set({
     status: 'completed',
+    aiResult: result,
+    leaseOwner: null,
+    leasedUntil: null,
+    leaseExpiresAtMillis: null,
     completedAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
+
+  const batchId = String(jobData?.batchId || '').trim();
+  if (batchId) {
+    await db.collection('bulk_product_import_batches').doc(batchId).set({
+      completedCount: FieldValue.increment(1),
+      reviewRequiredCount: FieldValue.increment(result.requiresAdminReview ? 1 : 0),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
 
   await notifyProductAiReady({
     uid,
@@ -3637,9 +4143,270 @@ async function processProductAiJob(jobId, jobData, apiKey) {
   return result;
 }
 
+async function markProductAiJobFailed(jobId, jobData, message) {
+  const uid = String(jobData.uid || '').trim();
+  const draftId = String(jobData.draftId || '').trim();
+  const batchId = String(jobData.batchId || '').trim();
+  await db.collection('product_ai_jobs').doc(jobId).set({
+    status: 'failed',
+    error: message.slice(0, 500),
+    lastError: message.slice(0, 500),
+    leaseOwner: null,
+    leasedUntil: null,
+    leaseExpiresAtMillis: null,
+    attemptCount: FieldValue.increment(1),
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  if (uid && draftId) {
+    await db.collection('product_drafts').doc(uid).collection('items').doc(draftId).set({
+      aiStatus: 'failed',
+      aiError: message.slice(0, 500),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  if (batchId) {
+    await db.collection('bulk_product_import_batches').doc(batchId).set({
+      failedCount: FieldValue.increment(1),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+}
+
+function productAiJobAnchorMillis(data, now = Date.now()) {
+  const updatedAtMillis = data?.updatedAt && typeof data.updatedAt.toMillis === 'function'
+    ? data.updatedAt.toMillis()
+    : 0;
+  const createdAtMillis = productAiJobCreatedAtMillis(data);
+  return updatedAtMillis || createdAtMillis || now;
+}
+
+function isInteractiveProductAiJobStale(data, now = Date.now()) {
+  const status = String(data?.status || '');
+  if (status !== 'queued' && status !== 'processing') {
+    return false;
+  }
+  if (status === 'processing') {
+    const leasedUntil = Number(data.leasedUntil || data.leaseExpiresAtMillis || 0);
+    if (leasedUntil > now) {
+      return false;
+    }
+  }
+  const anchor = productAiJobAnchorMillis(data, now);
+  return (now - anchor) > PRODUCT_AI_INTERACTIVE_QUEUE_TTL_MS;
+}
+
+async function recoverStaleQueuedInteractiveJobs(now = Date.now()) {
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('jobType', '==', 'interactive')
+    .limit(50)
+    .get();
+  let recovered = 0;
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    const data = doc.data() || {};
+    if (!isInteractiveProductAiJobStale(data, now)) {
+      return;
+    }
+    recovered += 1;
+    await doc.ref.set({
+      status: 'cancelled',
+      leaseOwner: null,
+      leasedUntil: null,
+      leaseExpiresAtMillis: null,
+      message: 'คิว interactive หมดอายุ',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+  return recovered;
+}
+
+async function hasInteractiveProductAiPending(now = Date.now()) {
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('jobType', '==', 'interactive')
+    .limit(40)
+    .get();
+  return snapshot.docs.some((doc) => {
+    const data = doc.data() || {};
+    const status = String(data.status || '');
+    if (isInteractiveProductAiJobStale(data, now)) {
+      return false;
+    }
+    if (status === 'queued') {
+      return Number(data.nextRunAt || 0) <= now;
+    }
+    if (status === 'processing') {
+      const leasedUntil = Number(data.leasedUntil || data.leaseExpiresAtMillis || 0);
+      return leasedUntil > now;
+    }
+    return false;
+  });
+}
+
+async function releaseDeferredBackgroundJobsIfInteractiveIdle(now = Date.now()) {
+  const interactivePending = await hasInteractiveProductAiPending(now);
+  if (interactivePending) {
+    return 0;
+  }
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('jobType', '==', 'background')
+    .limit(100)
+    .get();
+  let released = 0;
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    const data = doc.data() || {};
+    if (String(data.status || '') !== 'queued') return;
+    const nextRunAt = Number(data.nextRunAt || 0);
+    if (nextRunAt <= now) return;
+    released += 1;
+    await doc.ref.set({
+      priority: PRODUCT_AI_PRIORITY_BULK,
+      nextRunAt: now,
+      message: 'พร้อมเข้าคิว AI bulk',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+  return released;
+}
+
+async function runBackgroundProductAiJobNow(jobId, jobData, apiKey, leaseOwner) {
+  const jobRef = db.collection('product_ai_jobs').doc(jobId);
+  const claimed = await claimQueuedProductAiJob({ ref: jobRef, id: jobId }, leaseOwner);
+  if (!claimed) {
+    return { status: 'queued' };
+  }
+  const outcome = await runClaimedProductAiJob(jobId, claimed, apiKey);
+  return { status: outcome.ok ? 'completed' : 'failed' };
+}
+
+async function yieldBackgroundProcessingJobs(keepJobId = '') {
+  const now = Date.now();
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('status', '==', 'processing')
+    .limit(50)
+    .get();
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    if (doc.id === keepJobId) return;
+    const data = doc.data() || {};
+    if (String(data.jobType || '') !== 'background') return;
+    await doc.ref.set({
+      status: 'queued',
+      priority: PRODUCT_AI_PRIORITY_BULK - 10,
+      nextRunAt: now + PRODUCT_AI_BACKGROUND_DEFER_MS,
+      leaseOwner: null,
+      leasedUntil: null,
+      leaseExpiresAtMillis: null,
+      message: 'รอให้วิเคราะห์สินค้าเดี่ยวเสร็จก่อน',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+}
+
+async function deferQueuedBackgroundJobs(deferMs = PRODUCT_AI_BACKGROUND_DEFER_MS) {
+  const now = Date.now();
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('jobType', '==', 'background')
+    .limit(100)
+    .get();
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    const data = doc.data() || {};
+    if (String(data.status || '') !== 'queued') return;
+    const existingNextRun = Number(data.nextRunAt || 0);
+    await doc.ref.set({
+      priority: PRODUCT_AI_PRIORITY_BULK - 10,
+      nextRunAt: Math.max(existingNextRun, now + deferMs),
+      message: 'รอให้วิเคราะห์สินค้าเดี่ยวเสร็จก่อน',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+}
+
+async function recoverStaleProcessingProductAiJobs(keepJobId = '') {
+  const now = Date.now();
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('status', '==', 'processing')
+    .limit(50)
+    .get();
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    if (doc.id === keepJobId) return;
+    const data = doc.data() || {};
+    const leasedUntil = Number(data.leasedUntil || data.leaseExpiresAtMillis || 0);
+    const updatedAtMillis = data.updatedAt && typeof data.updatedAt.toMillis === 'function'
+      ? data.updatedAt.toMillis()
+      : 0;
+    const leaseExpired = leasedUntil > 0 && leasedUntil <= now;
+    const staleWithoutLease = leasedUntil <= 0 &&
+      updatedAtMillis > 0 &&
+      (now - updatedAtMillis) > 4 * 60 * 1000;
+    if (!leaseExpired && !staleWithoutLease) return;
+    const jobType = String(data.jobType || 'background');
+    await doc.ref.set({
+      status: 'queued',
+      jobType,
+      priority: jobType === 'interactive'
+        ? PRODUCT_AI_PRIORITY_INTERACTIVE
+        : PRODUCT_AI_PRIORITY_BULK - 10,
+      nextRunAt: now,
+      leaseOwner: null,
+      leasedUntil: null,
+      leaseExpiresAtMillis: null,
+      message: 'กำลังเข้าคิว AI อีกครั้ง...',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+}
+
+async function runInteractiveProductAiJobNow(jobId, jobPayload, apiKey, leaseOwner) {
+  await yieldBackgroundProcessingJobs(jobId);
+
+  const jobRef = db.collection('product_ai_jobs').doc(jobId);
+  const claimed = await claimQueuedProductAiJob({ ref: jobRef, id: jobId }, leaseOwner);
+  if (!claimed) {
+    return { status: 'queued', aiResult: null, error: null };
+  }
+  const outcome = await runClaimedProductAiJob(jobId, claimed, apiKey);
+  return {
+    status: outcome.ok ? 'completed' : 'failed',
+    aiResult: outcome.result || null,
+    error: outcome.error || null,
+  };
+}
+
+async function requeueProductAiJob(jobId, jobData, message) {
+  const uid = String(jobData.uid || '').trim();
+  const draftId = String(jobData.draftId || '').trim();
+  const jobType = String(jobData.jobType || 'background');
+  const priority = jobType === 'interactive'
+    ? PRODUCT_AI_PRIORITY_INTERACTIVE
+    : Number(jobData.priority || PRODUCT_AI_PRIORITY_BULK);
+  await db.collection('product_ai_jobs').doc(jobId).set({
+    status: 'queued',
+    jobType,
+    priority,
+    nextRunAt: Date.now() + 15 * 1000,
+    leaseExpiresAtMillis: null,
+    leaseOwner: null,
+    leasedUntil: null,
+    attemptCount: FieldValue.increment(1),
+    lastError: message.slice(0, 500),
+    lastQueueMessage: message.slice(0, 500),
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  if (uid && draftId) {
+    await db.collection('product_drafts').doc(uid).collection('items').doc(draftId).set({
+      aiStatus: 'queued',
+      aiQueueMessage: message.slice(0, 500),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+}
+
 exports.enqueueProductAiAnalysis = onCall(
   {
     region: DEFAULT_REGION,
+    secrets: [GEMINI_API_KEY],
+    timeoutSeconds: 300,
+    memory: '512MiB',
   },
   async (request) => {
     if (!request.auth?.uid) {
@@ -3658,9 +4425,9 @@ exports.enqueueProductAiAnalysis = onCall(
     const jobId = normalizeAiRequestId(request.data?.requestId);
     const uid = request.auth.uid;
     const jobRef = db.collection('product_ai_jobs').doc(jobId);
-
-    await jobRef.set({
+    const jobPayload = {
       uid,
+      ownerUid: uid,
       draftId,
       imageUrl,
       thumbnailUrl: String(request.data?.thumbnailUrl || '').trim() || null,
@@ -3671,20 +4438,203 @@ exports.enqueueProductAiAnalysis = onCall(
       price: String(request.data?.price || '').trim(),
       weight: String(request.data?.weight || '').trim(),
       weightUnit: String(request.data?.weightUnit || '').trim(),
+      jobType: 'interactive',
+      priority: PRODUCT_AI_PRIORITY_INTERACTIVE,
+      attemptCount: 0,
+      nextRunAt: Date.now(),
       status: 'queued',
+      queuePosition: 1,
+      estimatedWaitSeconds: 0,
+      message: 'กำลังรอคิว AI...',
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    };
 
+    await jobRef.set(jobPayload, { merge: true });
     await db.collection('product_drafts').doc(uid).collection('items').doc(draftId).set({
       aiStatus: 'queued',
       aiRequestId: jobId,
       imageUrl,
       thumbnailUrl: String(request.data?.thumbnailUrl || '').trim() || null,
+      aiQueuedAt: FieldValue.serverTimestamp(),
+      queuePosition: 1,
+      estimatedWaitSeconds: 0,
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    return { jobId, status: 'queued' };
+    await Promise.all([
+      recoverStaleProcessingProductAiJobs(jobId),
+      supersedeOlderInteractiveJobs(uid, jobId),
+    ]);
+
+    const apiKey = String(GEMINI_API_KEY.value() || '').trim();
+    if (!apiKey) {
+      await markProductAiJobFailed(jobId, jobPayload, 'missing_gemini_api_key');
+      throw new HttpsError('failed-precondition', 'ระบบ AI ยังไม่พร้อม กรุณาลองใหม่ภายหลัง');
+    }
+
+    const outcome = await runInteractiveProductAiJobNow(
+      jobId,
+      jobPayload,
+      apiKey,
+      'enqueueProductAiAnalysis',
+    );
+    return {
+      jobId,
+      status: outcome.status,
+      aiResult: outcome.aiResult || null,
+      error: outcome.error || null,
+    };
+  },
+);
+
+exports.enqueueBulkProductAiAnalysis = onCall(
+  {
+    region: DEFAULT_REGION,
+    secrets: [GEMINI_API_KEY],
+    timeoutSeconds: 120,
+    memory: '512MiB',
+  },
+  async (request) => {
+    if (!request.auth?.uid) {
+      throw new HttpsError('unauthenticated', 'กรุณาเข้าสู่ระบบก่อนใช้งาน AI');
+    }
+
+    const uid = request.auth.uid;
+    const rawItems = Array.isArray(request.data?.items) ? request.data.items : [];
+    if (rawItems.length === 0) {
+      throw new HttpsError('invalid-argument', 'ไม่พบรายการรูปสินค้าสำหรับ bulk AI');
+    }
+    const interactivePending = await hasInteractiveProductAiPending();
+    const bulkDeferMs = interactivePending ? PRODUCT_AI_BACKGROUND_DEFER_MS : 0;
+    if (rawItems.length > PRODUCT_AI_BULK_MAX_ITEMS) {
+      throw new HttpsError('invalid-argument', `เพิ่มได้สูงสุด ${PRODUCT_AI_BULK_MAX_ITEMS} รูปต่อ batch`);
+    }
+
+    const batchId = normalizeAiRequestId(request.data?.batchId);
+    const isRetry = request.data?.retry === true;
+    const batchRef = db.collection('bulk_product_import_batches').doc(batchId);
+    const now = FieldValue.serverTimestamp();
+    const writer = db.bulkWriter();
+
+    if (isRetry) {
+      writer.set(batchRef, {
+        status: 'queued',
+        failedCount: FieldValue.increment(-rawItems.length),
+        updatedAt: now,
+      }, { merge: true });
+    } else {
+      writer.set(batchRef, {
+        createdByUid: uid,
+        ownerUid: uid,
+        targetApp: 'van1',
+        status: 'queued',
+        totalCount: rawItems.length,
+        completedCount: 0,
+        failedCount: 0,
+        reviewRequiredCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      }, { merge: true });
+    }
+
+    rawItems.forEach((rawItem, index) => {
+      const item = rawItem || {};
+      const imageUrl = String(item.imageUrl || '').trim();
+      const draftId = String(item.draftId || '').trim();
+      if (!imageUrl || !draftId) {
+        return;
+      }
+      const jobId = normalizeAiRequestId(item.requestId || `${batchId}_${index}`);
+      const thumbnailUrl = String(item.thumbnailUrl || '').trim();
+      const bulkIndex = Number.isFinite(Number(item.bulkIndex)) ? Number(item.bulkIndex) : index;
+      const jobRef = db.collection('product_ai_jobs').doc(jobId);
+      const draftRef = db.collection('product_drafts').doc(uid).collection('items').doc(draftId);
+
+      writer.set(jobRef, {
+        uid,
+        ownerUid: uid,
+        draftId,
+        imageUrl,
+        thumbnailUrl: thumbnailUrl || null,
+        batchId,
+        bulkIndex,
+        jobType: 'background',
+        priority: isRetry ? PRODUCT_AI_PRIORITY_BULK_RETRY : PRODUCT_AI_PRIORITY_BULK,
+        attemptCount: 0,
+        nextRunAt: Date.now() + bulkDeferMs,
+        productName: String(item.productName || '').trim(),
+        description: String(item.description || '').trim(),
+        category: String(item.category || '').trim(),
+        unit: String(item.unit || '').trim(),
+        price: String(item.price || '').trim(),
+        weight: String(item.weight || '').trim(),
+        weightUnit: String(item.weightUnit || '').trim(),
+        status: 'queued',
+        aiResult: null,
+        error: null,
+        lastError: null,
+        leaseOwner: null,
+        leasedUntil: null,
+        leaseExpiresAtMillis: null,
+        message: bulkDeferMs > 0
+          ? 'รอให้วิเคราะห์สินค้าเดี่ยวเสร็จก่อน'
+          : 'พร้อมเข้าคิว AI bulk',
+        createdAt: now,
+        updatedAt: now,
+      }, { merge: true });
+
+      writer.set(draftRef, {
+        draftId,
+        bulkBatchId: batchId,
+        bulkIndex,
+        imageUrl,
+        thumbnailUrl: thumbnailUrl || null,
+        aiStatus: 'queued',
+        aiRequestId: jobId,
+        queuePosition: bulkIndex + 1,
+        estimatedWaitSeconds: Math.max(10, (bulkIndex + 1) * AI_QUEUE_AVERAGE_SECONDS),
+        aiQueuedAt: now,
+        aiError: null,
+        updatedAt: now,
+        expiresAtMillis: Date.now() + 48 * 60 * 60 * 1000,
+      }, { merge: true });
+    });
+
+    await writer.close();
+
+    await recoverStaleQueuedInteractiveJobs();
+    await releaseDeferredBackgroundJobsIfInteractiveIdle();
+    processQueuedProductAiJobsTick({ maxRounds: 3 }).catch((error) => {
+      logger.warn('enqueueBulkProductAiAnalysis worker kick failed', {
+        batchId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    return {
+      batchId,
+      status: 'queued',
+      totalCount: rawItems.length,
+    };
+  },
+);
+
+exports.kickProductAiWorker = onCall(
+  {
+    region: DEFAULT_REGION,
+    secrets: [GEMINI_API_KEY],
+    timeoutSeconds: 540,
+    memory: '512MiB',
+  },
+  async (request) => {
+    if (!request.auth?.uid) {
+      throw new HttpsError('unauthenticated', 'กรุณาเข้าสู่ระบบก่อนใช้งาน AI');
+    }
+    await recoverStaleQueuedInteractiveJobs();
+    await recoverStaleProcessingProductAiJobs('');
+    await releaseDeferredBackgroundJobsIfInteractiveIdle();
+    return processQueuedProductAiJobsTick({ maxRounds: PRODUCT_AI_WORKER_KICK_MAX_ROUNDS });
   },
 );
 
@@ -3693,7 +4643,7 @@ exports.onProductAiJobQueued = onDocumentCreated(
     document: 'product_ai_jobs/{jobId}',
     region: DEFAULT_REGION,
     secrets: [GEMINI_API_KEY],
-    timeoutSeconds: 120,
+    timeoutSeconds: 300,
     memory: '512MiB',
   },
   async (event) => {
@@ -3702,46 +4652,250 @@ exports.onProductAiJobQueued = onDocumentCreated(
     if (String(jobData.status || '') !== 'queued') {
       return null;
     }
-
     const apiKey = String(GEMINI_API_KEY.value() || '').trim();
     if (!apiKey) {
-      await db.collection('product_ai_jobs').doc(jobId).set({
-        status: 'failed',
-        error: 'missing_gemini_api_key',
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
+      await markProductAiJobFailed(jobId, jobData, 'missing_gemini_api_key');
       return null;
     }
 
-    await db.collection('product_ai_jobs').doc(jobId).set({
-      status: 'processing',
+    const jobType = String(jobData.jobType || 'interactive');
+    if (jobType === 'background') {
+      if (await hasInteractiveProductAiPending()) {
+        return null;
+      }
+      await runBackgroundProductAiJobNow(
+        jobId,
+        jobData,
+        apiKey,
+        'onProductAiJobQueued',
+      );
+      return null;
+    }
+
+    const outcome = await runInteractiveProductAiJobNow(
+      jobId,
+      jobData,
+      apiKey,
+      'onProductAiJobQueued',
+    );
+    if (outcome.status === 'queued') {
+      return null;
+    }
+    return null;
+  },
+);
+
+async function supersedeOlderInteractiveJobs(uid, keepJobId) {
+  const snapshot = await db.collection('product_ai_jobs')
+    .where('uid', '==', uid)
+    .limit(50)
+    .get();
+  await Promise.all(snapshot.docs.map(async (doc) => {
+    if (doc.id === keepJobId) return;
+    const data = doc.data() || {};
+    if (String(data.jobType || '') !== 'interactive') return;
+    const status = String(data.status || '');
+    if (status !== 'queued' && status !== 'processing') return;
+    await doc.ref.set({
+      status: 'cancelled',
+      supersededBy: keepJobId,
+      leaseOwner: null,
+      leasedUntil: null,
+      leaseExpiresAtMillis: null,
+      message: 'ถูกแทนที่ด้วยคำขอวิเคราะห์ล่าสุด',
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
+  }));
+}
 
-    try {
-      await processProductAiJob(jobId, jobData, apiKey);
-      return null;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error('onProductAiJobQueued failed', { jobId, message });
-      await db.collection('product_ai_jobs').doc(jobId).set({
-        status: 'failed',
-        error: message.slice(0, 500),
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
+async function claimQueuedProductAiJob(jobDoc, leaseOwner = 'processQueuedProductAiJobs') {
+  const jobRef = jobDoc.ref;
+  const leaseExpiresAtMillis = Date.now() + 3 * 60 * 1000;
+  let claimed = null;
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(jobRef);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    if (String(data.status || '') !== 'queued') return;
+    const nextRunAt = Number(data.nextRunAt || 0);
+    if (nextRunAt > Date.now()) return;
+    claimed = data;
+    tx.set(jobRef, {
+      status: 'processing',
+      leaseExpiresAtMillis,
+      leaseOwner,
+      leasedUntil: leaseExpiresAtMillis,
+      startedAt: FieldValue.serverTimestamp(),
+      aiStartedAt: FieldValue.serverTimestamp(),
+      message: 'ถึงคิวแล้ว กำลังประมวลผล AI...',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+  return claimed;
+}
 
-      const uid = String(jobData.uid || '').trim();
-      const draftId = String(jobData.draftId || '').trim();
-      if (uid && draftId) {
-        await db.collection('product_drafts').doc(uid).collection('items').doc(draftId).set({
-          aiStatus: 'failed',
-          aiError: message.slice(0, 500),
-          updatedAt: FieldValue.serverTimestamp(),
-        }, { merge: true });
-      }
-      return null;
+async function runClaimedProductAiJob(jobId, claimed, apiKey) {
+  try {
+    const result = await processProductAiJob(jobId, claimed, apiKey);
+    return { ok: true, result, error: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error('product AI job failed', { jobId, message });
+    if (error?.code === 'deadline-exceeded' || error?.code === 'resource-exhausted') {
+      await requeueProductAiJob(jobId, claimed, message);
+      return { ok: false, result: null, error: message };
     }
+    await markProductAiJobFailed(jobId, claimed, message);
+    return { ok: false, result: null, error: message };
+  }
+}
+
+async function processQueuedProductAiJobsRound() {
+  const apiKey = String(GEMINI_API_KEY.value() || '').trim();
+  if (!apiKey) {
+    logger.error('processQueuedProductAiJobs missing GEMINI_API_KEY');
+    return { processed: 0, reason: 'missing_gemini_api_key' };
+  }
+
+  const now = Date.now();
+  const activeSnapshot = await db.collection('product_ai_jobs')
+    .where('status', '==', 'processing')
+    .limit(50)
+    .get();
+  const activeJobs = [];
+  for (const doc of activeSnapshot.docs) {
+    const data = doc.data() || {};
+    const leasedUntil = Number(data.leasedUntil || data.leaseExpiresAtMillis || 0);
+    const updatedAtMillis = data.updatedAt && typeof data.updatedAt.toMillis === 'function'
+      ? data.updatedAt.toMillis()
+      : 0;
+    const leaseFresh = leasedUntil > now &&
+      (updatedAtMillis === 0 || (now - updatedAtMillis) < 2 * 60 * 1000);
+    if (leaseFresh) {
+      activeJobs.push(data);
+      continue;
+    }
+    await doc.ref.set({
+      status: 'queued',
+      jobType: String(data.jobType || 'background'),
+      priority: Number(data.priority || 0),
+      leaseExpiresAtMillis: null,
+      leaseOwner: null,
+      leasedUntil: null,
+      nextRunAt: now,
+      message: 'กำลังเข้าคิว AI อีกครั้ง...',
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+  const activeOwners = new Set(activeJobs.map((data) => String(data.uid || data.ownerUid || '').trim()).filter(Boolean));
+
+  const [interactiveSnap, backgroundSnap, queuedSnap] = await Promise.all([
+    db.collection('product_ai_jobs').where('jobType', '==', 'interactive').limit(40).get(),
+    db.collection('product_ai_jobs').where('jobType', '==', 'background').limit(40).get(),
+    db.collection('product_ai_jobs').where('status', '==', 'queued').limit(40).get(),
+  ]);
+  const queuedById = new Map();
+  for (const snap of [interactiveSnap, backgroundSnap, queuedSnap]) {
+    for (const doc of snap.docs) {
+      queuedById.set(doc.id, { doc, data: doc.data() || {} });
+    }
+  }
+  const queuedJobs = [...queuedById.values()]
+    .filter((job) => String(job.data.status || '') === 'queued')
+    .filter((job) => Number(job.data.nextRunAt || 0) <= now)
+    .sort((left, right) => {
+      const leftPriority = Number(left.data.priority || 0);
+      const rightPriority = Number(right.data.priority || 0);
+      if (leftPriority !== rightPriority) return rightPriority - leftPriority;
+      const leftInteractive = String(left.data.jobType || '') === 'interactive' ? 1 : 0;
+      const rightInteractive = String(right.data.jobType || '') === 'interactive' ? 1 : 0;
+      if (leftInteractive !== rightInteractive) return rightInteractive - leftInteractive;
+      const leftCreatedAt = productAiJobCreatedAtMillis(left.data);
+      const rightCreatedAt = productAiJobCreatedAtMillis(right.data);
+      if (leftCreatedAt !== rightCreatedAt) {
+        return leftInteractive || rightInteractive
+          ? rightCreatedAt - leftCreatedAt
+          : leftCreatedAt - rightCreatedAt;
+      }
+      const leftIndex = Number(left.data.bulkIndex || 0);
+      const rightIndex = Number(right.data.bulkIndex || 0);
+      return leftIndex - rightIndex;
+    });
+
+  const interactivePending = await hasInteractiveProductAiPending(now);
+  if (interactivePending) {
+    await yieldBackgroundProcessingJobs('');
+    activeJobs.splice(0, activeJobs.length, ...activeJobs.filter(
+      (job) => String(job.jobType || '') !== 'background',
+    ));
+    activeOwners.clear();
+    for (const ownerUid of activeJobs.map(
+      (data) => String(data.uid || data.ownerUid || '').trim(),
+    ).filter(Boolean)) {
+      activeOwners.add(ownerUid);
+    }
+  }
+
+  const eligibleQueuedJobs = interactivePending
+    ? queuedJobs.filter((job) => String(job.data.jobType || '') === 'interactive')
+    : queuedJobs;
+  const slots = Math.max(0, PRODUCT_AI_WORKER_MAX_JOBS - activeJobs.length);
+  if (slots <= 0 || eligibleQueuedJobs.length === 0) {
+    return { processed: 0, reason: slots <= 0 ? 'no_slots' : 'no_eligible_jobs' };
+  }
+
+  let processed = 0;
+  const ownersStartedThisTick = new Set();
+  for (const queued of eligibleQueuedJobs) {
+    if (processed >= slots) break;
+    const ownerUid = String(queued.data.uid || queued.data.ownerUid || '').trim();
+    const isInteractive = String(queued.data.jobType || '') === 'interactive';
+    if (
+      ownerUid &&
+      !isInteractive &&
+      PRODUCT_AI_WORKER_MAX_PER_OWNER <= 1 &&
+      (activeOwners.has(ownerUid) || ownersStartedThisTick.has(ownerUid))
+    ) {
+      continue;
+    }
+    const claimed = await claimQueuedProductAiJob(queued.doc);
+    if (!claimed) continue;
+    if (ownerUid) ownersStartedThisTick.add(ownerUid);
+    await runClaimedProductAiJob(queued.doc.id, claimed, apiKey);
+    processed += 1;
+  }
+
+  return { processed, reason: 'ok' };
+}
+
+async function processQueuedProductAiJobsTick(options = {}) {
+  const maxRounds = Math.max(1, Number(options.maxRounds || 1));
+  await recoverStaleQueuedInteractiveJobs();
+  await recoverStaleProcessingProductAiJobs('');
+  await releaseDeferredBackgroundJobsIfInteractiveIdle();
+
+  let totalProcessed = 0;
+  let lastReason = 'ok';
+  for (let round = 0; round < maxRounds; round += 1) {
+    const result = await processQueuedProductAiJobsRound();
+    totalProcessed += Number(result.processed || 0);
+    lastReason = result.reason || lastReason;
+    if (Number(result.processed || 0) <= 0) {
+      break;
+    }
+  }
+  return { processed: totalProcessed, reason: lastReason };
+}
+
+exports.processQueuedProductAiJobs = onSchedule(
+  {
+    schedule: 'every 1 minutes',
+    region: DEFAULT_REGION,
+    secrets: [GEMINI_API_KEY],
+    timeoutSeconds: 540,
+    memory: '512MiB',
   },
+  async () => processQueuedProductAiJobsTick(),
 );
 
 exports.replaceImageBackgroundWhite = onCall(
@@ -4531,6 +5685,13 @@ exports.initiateCall = functions
         code: error?.code,
         message: error?.message,
       });
+      if (isUnregisteredFcmTokenError(error)) {
+        await clearInvalidRecipientFcmToken(calleeId, fcmToken);
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Callee notification token is no longer registered. Ask the callee to reopen the app and allow notifications.'
+        );
+      }
       throw new functions.https.HttpsError(
         'failed-precondition',
         `Call notification could not be sent: ${error?.message || 'unknown messaging error'}`
@@ -4643,6 +5804,8 @@ async function resolveOrCreateActiveCallInvite({
   const sessionCollection = db.collection('call_sessions');
   const inviteExpiry = admin.firestore.Timestamp.fromMillis(Date.now() + CALL_TTL_MS);
   const { appId } = resolveAgoraConfig();
+  const freshChannelId = `call_${calleeId}_${Date.now()}`;
+  const freshToken = await buildAgoraToken(freshChannelId);
   let invite = null;
   let created = false;
 
@@ -4667,18 +5830,16 @@ async function resolveOrCreateActiveCallInvite({
       transaction.delete(inviteRef);
     }
 
-    const channelId = `call_${calleeId}_${Date.now()}`;
-    const token = await buildAgoraToken(channelId);
     console.log('[callInvite] created fresh invite', {
       callerId,
       calleeId,
-      channelId,
+      channelId: freshChannelId,
       isVideo,
       callType,
     });
     invite = {
-      channelId,
-      token,
+      channelId: freshChannelId,
+      token: freshToken,
       appId,
       callerId,
       calleeId,
@@ -4737,19 +5898,39 @@ async function buildAgoraToken(channelId, uid = 0) {
     );
   } catch (error) {
     console.error('[agora] Failed to build token', { channelId, error });
-    throw new functions.https.HttpsError('internal', 'Unable to create Agora token');
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'Unable to create Agora token. Check AGORA_APP_ID and AGORA_APP_CERTIFICATE secrets.'
+    );
   }
 }
 
 function resolveAgoraConfig() {
-  const appId = (AGORA_APP_ID_SECRET.value() || process.env.AGORA_APP_ID || '').trim();
-  const appCertificate = (AGORA_APP_CERT_SECRET.value() || process.env.AGORA_APP_CERTIFICATE || '').trim();
-  const ttlRaw = (AGORA_TTL_SECRET.value() || process.env.AGORA_APP_TTL_SECONDS || '3600').trim();
+  const appId = readSecretOrEnv(AGORA_APP_ID_SECRET, 'AGORA_APP_ID');
+  const appCertificate = readSecretOrEnv(AGORA_APP_CERT_SECRET, 'AGORA_APP_CERTIFICATE');
+  const ttlRaw = readSecretOrEnv(
+    AGORA_TTL_SECRET,
+    'AGORA_APP_TTL_SECONDS',
+    '3600'
+  );
   let tokenTtl = parseInt(ttlRaw, 10);
   if (!Number.isFinite(tokenTtl) || tokenTtl <= 0) {
     tokenTtl = 3600;
   }
   return { appId, appCertificate, tokenTtl };
+}
+
+function readSecretOrEnv(secret, envName, fallback = '') {
+  try {
+    const value = secret.value();
+    if (value) return String(value).trim();
+  } catch (error) {
+    console.warn('[secrets] Firebase secret unavailable, falling back to env', {
+      envName,
+      message: error?.message,
+    });
+  }
+  return String(process.env[envName] || fallback).trim();
 }
 
 async function getOrCreateUserProfile(uid) {

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -20,11 +19,11 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:http/http.dart' as http;
 import '../models/product_model.dart'; // Import the model
 import '../models/product_variant.dart';
+import 'bulk_ai_product_import_screen.dart';
 import 'product_variant_setup_screen.dart';
 import 'utils/app_colors.dart';
 import 'utils/network_image_url.dart';
 import 'utils/shop_profile_resolver.dart';
-import 'widgets/product_network_image.dart';
 import 'storage_helper.dart';
 import 'services/product_cache_service.dart';
 import 'services/shop_profile_cache_service.dart';
@@ -165,12 +164,18 @@ class AddProductScreen extends StatefulWidget {
   final Product? productToEdit;
   final AdminProductUploadContext? adminUploadContext;
   final String? draftId;
+  final String? initialLocalImagePath;
+  final String? initialImageUrl;
+  final Map<String, dynamic>? initialAiResult;
 
   const AddProductScreen({
     super.key,
     this.productToEdit,
     this.adminUploadContext,
     this.draftId,
+    this.initialLocalImagePath,
+    this.initialImageUrl,
+    this.initialAiResult,
   });
 
   @override
@@ -182,6 +187,7 @@ class AddProductScreenState extends State<AddProductScreen>
   static const double _gpRate = 0.18;
   static const int _kAiConfidenceThreshold = 80;
   static const Duration _aiCallableTimeout = Duration(seconds: 120);
+  static const Duration _enqueueAiCallableTimeout = Duration(seconds: 240);
 
   bool get _isAdminDelegatedUpload => widget.adminUploadContext != null;
 
@@ -191,6 +197,15 @@ class AddProductScreenState extends State<AddProductScreen>
 
   bool get _draftPersistenceEnabled =>
       widget.productToEdit == null && !_isAdminDelegatedUpload;
+
+  bool get _isReusingBulkAiSource =>
+      (widget.initialAiResult != null && widget.initialAiResult!.isNotEmpty) ||
+      (widget.initialLocalImagePath ?? '').trim().isNotEmpty ||
+      (widget.initialImageUrl ?? '').trim().isNotEmpty;
+
+  bool _isBulkDraftId(String? draftId) {
+    return (draftId ?? '').contains('_bulk_');
+  }
 
   String? get _effectiveOwnerUid =>
       widget.adminUploadContext?.ownerUid ??
@@ -225,6 +240,7 @@ class AddProductScreenState extends State<AddProductScreen>
   final Set<String> _cacheLookupInProgress = {};
 
   bool _isSaving = false;
+  bool _imagePickerBusy = false;
   bool _isResolvingServiceType = true;
   bool _showPriceGuidance = false;
   bool _showPreparationTimeGuidance = false;
@@ -262,16 +278,48 @@ class AddProductScreenState extends State<AddProductScreen>
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
   _aiQueueSubscription;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
-  _draftWatchSubscription;
+      _draftWatchSubscription;
   Timer? _draftSaveDebounce;
+  Timer? _aiDraftPollTimer;
+  Timer? _aiJobProbeTimer;
+  bool _aiDraftPollInFlight = false;
   bool _draftRestoreComplete = false;
   bool _draftSessionClosed = false;
-  Future<void>? _draftSessionFuture;
+  bool _localMediaDirty = false;
   String? _activeDraftId;
   String? _aiQueueStatusText;
   bool _aiQueueExternalRecommendation = false;
   double? _uploadProgress;
   String? _uploadStatusText;
+
+  double get _aiAnalysisProgress {
+    final status = (_aiQueueStatusText ?? '').trim();
+    if (status.contains('สำเร็จ')) return 1;
+    if (status.contains('ประมวลผล') || status.contains('ถึงคิว')) return 0.75;
+    if (status.contains('รอคิว') || status.contains('คิวที่')) return 0.35;
+    if (status.contains('เข้าคิว') || status.contains('ส่งเข้าคิว')) return 0.22;
+    if (status.contains('อัปโหลดรูป')) return 0.16;
+    if (status.contains('เตรียม') || status.contains('ส่งคำขอ')) return 0.12;
+    return 0.08;
+  }
+
+  double get _productSaveProgress {
+    final status = (_uploadStatusText ?? '').trim();
+    final uploadProgress = _uploadProgress;
+    if (status.contains('อัปโหลดรูป') && uploadProgress != null) {
+      return (0.2 + (uploadProgress * 0.45)).clamp(0.0, 0.65).toDouble();
+    }
+    if (status.contains('อัปโหลดวิดีโอ')) {
+      return uploadProgress == null
+          ? 0.65
+          : (0.65 + (uploadProgress * 0.12)).clamp(0.0, 0.77).toDouble();
+    }
+    if (status.contains('โหลดข้อมูล')) return 0.15;
+    if (status.contains('ร้าน')) return 0.78;
+    if (status.contains('บันทึก')) return 0.88;
+    if (status.contains('อัปเดตข้อมูลในเครื่อง')) return 0.96;
+    return 0.08;
+  }
 
   static const int _defaultMaxImageCount = 1;
   static const Duration _maxVideoDuration = Duration(minutes: 5);
@@ -283,8 +331,22 @@ class AddProductScreenState extends State<AddProductScreen>
   static const int _thumbnailImageQuality = 60;
   String? _serviceType;
 
-  int get _currentImageCount =>
-      _existingImageUrls.length + _newImageFiles.length;
+  bool _localImageFileReady(String path) {
+    if (path.trim().isEmpty) return false;
+    if (kIsWeb) return true;
+    return File(path).existsSync();
+  }
+
+  int get _currentImageCount {
+    final localReadyCount = _newImageFiles
+        .where((file) => _localImageFileReady(file.path))
+        .length;
+    if (_maxImageCount == 1) {
+      if (localReadyCount > 0) return 1;
+      return _existingImageUrls.isEmpty ? 0 : 1;
+    }
+    return _existingImageUrls.length + localReadyCount;
+  }
   bool get _canAddVideo => _adminCanUploadVideo == true;
 
   int get _maxImageCount {
@@ -481,8 +543,10 @@ class AddProductScreenState extends State<AddProductScreen>
       unawaited(_hydrateWeightFromFirestore());
       unawaited(_loadVariantsForEdit());
     } else if (_draftPersistenceEnabled) {
+      _seedInitialPickedImage();
+      _applyInitialAiResult(fallback: widget.initialAiResult);
       WidgetsBinding.instance.addObserver(this);
-      _draftSessionFuture = _initializeDraftSession();
+      unawaited(_initializeDraftSession());
     }
 
     final ownerUid = _effectiveOwnerUid;
@@ -495,13 +559,16 @@ class AddProductScreenState extends State<AddProductScreen>
     if (!_draftPersistenceEnabled) {
       return;
     }
-    final initFuture = _draftSessionFuture;
-    if (initFuture != null) {
-      await initFuture;
-    }
-    if (_activeDraftId == null || _activeDraftId!.isEmpty) {
+    final ownerUid = _effectiveOwnerUid;
+    if (ownerUid == null || ownerUid.isEmpty) {
       throw Exception('ไม่พบ draft session สำหรับ AI');
     }
+    if (_activeDraftId == null ||
+        _activeDraftId!.isEmpty ||
+        _isBulkDraftId(_activeDraftId)) {
+      _activeDraftId = ProductAddDraftStore.instance.createDraftId(ownerUid);
+    }
+    _startDraftWatch();
   }
 
   void _attachDraftFieldListeners() {
@@ -554,49 +621,85 @@ class AddProductScreenState extends State<AddProductScreen>
       return;
     }
 
+    _activeDraftId ??= ProductAddDraftStore.instance.createDraftId(ownerUid);
     final localDraft = await ProductAddDraftStore.instance.load(ownerUid);
-    var draftId = widget.draftId?.trim();
-    if (draftId == null || draftId.isEmpty) {
-      draftId = (localDraft?['draftId'] as String?)?.trim();
-    }
-    draftId = (draftId == null || draftId.isEmpty)
-        ? ProductAddDraftStore.instance.createDraftId(ownerUid)
-        : draftId;
-    _activeDraftId = draftId;
-
     Map<String, dynamic>? remoteDraft;
-    try {
-      remoteDraft = await ProductDraftService.instance.loadDraft(
-        ownerUid: ownerUid,
-        draftId: draftId,
-      );
-    } catch (error) {
-      debugPrint('Failed to load remote product draft: $error');
-    }
+    if (_isReusingBulkAiSource) {
+      if (!_isAnalyzingProductWithAi) {
+        _activeDraftId = ProductAddDraftStore.instance.createDraftId(ownerUid);
+      }
+    } else {
+      var draftId = widget.draftId?.trim();
+      if (draftId == null || draftId.isEmpty) {
+        draftId = (localDraft?['draftId'] as String?)?.trim();
+      }
+      if (draftId == null || draftId.isEmpty || _isBulkDraftId(draftId)) {
+        draftId = ProductAddDraftStore.instance.createDraftId(ownerUid);
+      }
+      if (!_isAnalyzingProductWithAi) {
+        _activeDraftId = draftId;
+      } else {
+        draftId = _activeDraftId ?? draftId;
+      }
 
-    if (_isDraftCompleted(localDraft) || _isDraftCompleted(remoteDraft)) {
-      await ProductAddDraftStore.instance.clear(ownerUid);
-      if (draftId.isNotEmpty) {
+      try {
+        remoteDraft = await ProductDraftService.instance.loadDraft(
+          ownerUid: ownerUid,
+          draftId: draftId,
+          source: Source.cache,
+        );
+      } catch (_) {
+        remoteDraft = null;
+      }
+      if (remoteDraft == null) {
         try {
-          await ProductDraftService.instance.deleteDraft(
+          remoteDraft = await ProductDraftService.instance
+              .loadDraft(ownerUid: ownerUid, draftId: draftId)
+              .timeout(const Duration(seconds: 3));
+        } catch (error) {
+          debugPrint('Failed to load remote product draft: $error');
+        }
+      }
+
+      if (_isDraftCompleted(localDraft) || _isDraftCompleted(remoteDraft)) {
+        await ProductAddDraftStore.instance.clear(ownerUid);
+        if (draftId.isNotEmpty) {
+          try {
+            await ProductDraftService.instance.deleteDraft(
+              ownerUid: ownerUid,
+              draftId: draftId,
+            );
+          } catch (error) {
+            debugPrint('Failed to delete completed remote draft: $error');
+          }
+          await ProductAddDraftStore.instance.deleteDraftMediaDir(
             ownerUid: ownerUid,
             draftId: draftId,
           );
-        } catch (error) {
-          debugPrint('Failed to delete completed remote draft: $error');
         }
-        await ProductAddDraftStore.instance.deleteDraftMediaDir(
-          ownerUid: ownerUid,
-          draftId: draftId,
-        );
+        draftId = ProductAddDraftStore.instance.createDraftId(ownerUid);
+        if (!_isAnalyzingProductWithAi) {
+          _activeDraftId = draftId;
+        }
+      } else if (!_isAnalyzingProductWithAi &&
+          !_localMediaDirty &&
+          _currentImageCount == 0) {
+        final merged = _mergeDraftSources(local: localDraft, remote: remoteDraft);
+        if (merged != null && mounted) {
+          await _applyDraftState(merged);
+        }
       }
-      draftId = ProductAddDraftStore.instance.createDraftId(ownerUid);
-      _activeDraftId = draftId;
-    } else {
-      final merged = _mergeDraftSources(local: localDraft, remote: remoteDraft);
-      if (merged != null && mounted) {
-        await _applyDraftState(merged);
-      }
+    }
+    if (!_isAnalyzingProductWithAi &&
+        !_localMediaDirty &&
+        _currentImageCount == 0) {
+      _seedInitialPickedImage();
+      _applyInitialAiResult(
+        fallback: _extractAiResult(localDraft) ?? _extractAiResult(remoteDraft),
+      );
+    }
+    if (mounted) {
+      setState(() {});
     }
 
     if (!mounted) return;
@@ -604,6 +707,66 @@ class AddProductScreenState extends State<AddProductScreen>
     _attachDraftFieldListeners();
     _startDraftWatch();
     unawaited(_persistDraftNow());
+  }
+
+  void _seedInitialPickedImage() {
+    final path = widget.initialLocalImagePath?.trim() ?? '';
+    final url = widget.initialImageUrl?.trim() ?? '';
+    if (path.isNotEmpty && File(path).existsSync()) {
+      _newImageFiles
+        ..clear()
+        ..add(XFile(path));
+      _existingImageUrls.clear();
+      _existingThumbnailUrls.clear();
+      if (url.isNotEmpty) {
+        _localMediaPaths[url] = path;
+      }
+      return;
+    }
+    if (url.isNotEmpty && _newImageFiles.isEmpty) {
+      _existingImageUrls = <String>[url];
+      _existingThumbnailUrls = <String>[url];
+    }
+  }
+
+  Map<String, dynamic>? _extractAiResult(Map<String, dynamic>? source) {
+    if (source == null || source.isEmpty) {
+      return null;
+    }
+    final nested = source['aiResult'];
+    if (nested is Map) {
+      final mapped = Map<String, dynamic>.from(nested);
+      if (_looksLikeAiResult(mapped)) {
+        return mapped;
+      }
+    }
+    if (_looksLikeAiResult(source)) {
+      return Map<String, dynamic>.from(source);
+    }
+    return null;
+  }
+
+  bool _looksLikeAiResult(Map<String, dynamic> data) {
+    return (data['productName'] ??
+            data['description'] ??
+            data['productType'] ??
+            data['productCategory'] ??
+            data['name'])
+        .toString()
+        .trim()
+        .isNotEmpty;
+  }
+
+  void _applyInitialAiResult({Map<String, dynamic>? fallback}) {
+    final result =
+        _extractAiResult(widget.initialAiResult) ?? _extractAiResult(fallback);
+    if (result == null || result.isEmpty) {
+      return;
+    }
+    _writeAiAnalysisToForm(_aiResultFromDynamicMap(result), force: true);
+    _hasUsedAiProductAnalysisForProduct = true;
+    _isAnalyzingProductWithAi = false;
+    _aiQueueStatusText = 'ประมวลผล AI สำเร็จ';
   }
 
   bool _isDraftCompleted(Map<String, dynamic>? draft) {
@@ -647,7 +810,7 @@ class AddProductScreenState extends State<AddProductScreen>
   }
 
   Future<void> _applyDraftState(Map<String, dynamic> draft) async {
-    if (_isDraftCompleted(draft)) {
+    if (_isDraftCompleted(draft) || _isAnalyzingProductWithAi) {
       return;
     }
 
@@ -755,64 +918,77 @@ class AddProductScreenState extends State<AddProductScreen>
           .toList();
     }
 
-    final existingImages = draft['existingImageUrls'];
-    if (existingImages is List) {
-      _existingImageUrls = existingImages
-          .map((entry) => entry?.toString().trim() ?? '')
-          .where((entry) => entry.isNotEmpty)
-          .toList();
-    }
-    final existingThumbs = draft['existingThumbnailUrls'];
-    if (existingThumbs is List) {
-      _existingThumbnailUrls = existingThumbs
-          .map((entry) => entry?.toString().trim() ?? '')
-          .where((entry) => entry.isNotEmpty)
-          .toList();
-    } else if (_existingImageUrls.isNotEmpty) {
-      _existingThumbnailUrls = List<String>.from(_existingImageUrls);
-    }
+    if (!_localMediaDirty) {
+      final existingImages = draft['existingImageUrls'];
+      if (existingImages is List) {
+        _existingImageUrls = existingImages
+            .map((entry) => entry?.toString().trim() ?? '')
+            .where((entry) => entry.isNotEmpty)
+            .toList();
+      }
+      final existingThumbs = draft['existingThumbnailUrls'];
+      if (existingThumbs is List) {
+        _existingThumbnailUrls = existingThumbs
+            .map((entry) => entry?.toString().trim() ?? '')
+            .where((entry) => entry.isNotEmpty)
+            .toList();
+      } else if (_existingImageUrls.isNotEmpty) {
+        _existingThumbnailUrls = List<String>.from(_existingImageUrls);
+      }
 
-    final imageUrl = (draft['imageUrl'] as String?)?.trim();
-    if (imageUrl != null &&
-        imageUrl.isNotEmpty &&
-        !_existingImageUrls.contains(imageUrl)) {
-      _existingImageUrls = <String>[imageUrl];
-      final thumbUrl = (draft['thumbnailUrl'] as String?)?.trim();
-      _existingThumbnailUrls = <String>[
-        thumbUrl != null && thumbUrl.isNotEmpty ? thumbUrl : imageUrl,
+      final imageUrl = (draft['imageUrl'] as String?)?.trim();
+      if (imageUrl != null &&
+          imageUrl.isNotEmpty &&
+          !_existingImageUrls.contains(imageUrl)) {
+        _existingImageUrls = <String>[imageUrl];
+        final thumbUrl = (draft['thumbnailUrl'] as String?)?.trim();
+        _existingThumbnailUrls = <String>[
+          thumbUrl != null && thumbUrl.isNotEmpty ? thumbUrl : imageUrl,
+        ];
+      }
+
+      _existingVideoUrl = (draft['existingVideoUrl'] as String?)?.trim();
+      _existingVideoThumbnailUrl =
+          (draft['existingVideoThumbnailUrl'] as String?)?.trim();
+
+      final localImagePaths = <String>[
+        if (draft['localImagePath'] != null)
+          draft['localImagePath'].toString(),
+        if (draft['sourceImageLocalPath'] != null)
+          draft['sourceImageLocalPath'].toString(),
+        if (draft['localImagePaths'] is List)
+          ...(draft['localImagePaths'] as List)
+              .map((entry) => entry.toString()),
       ];
-    }
-
-    _existingVideoUrl = (draft['existingVideoUrl'] as String?)?.trim();
-    _existingVideoThumbnailUrl = (draft['existingVideoThumbnailUrl'] as String?)
-        ?.trim();
-
-    final localImagePaths = draft['localImagePaths'];
-    if (localImagePaths is List) {
-      final restoredImages = <XFile>[];
-      for (var index = 0; index < localImagePaths.length; index++) {
-        final path = localImagePaths[index]?.toString().trim() ?? '';
-        if (path.isEmpty) continue;
-        if (kIsWeb) {
-          restoredImages.add(XFile(path));
-          continue;
-        }
-        if (await File(path).exists()) {
-          restoredImages.add(XFile(path));
+      final restoredLocalPaths = <String>[];
+      for (final rawPath in localImagePaths) {
+        final path = rawPath.trim();
+        if (path.isEmpty || restoredLocalPaths.contains(path)) continue;
+        if (kIsWeb || await File(path).exists()) {
+          restoredLocalPaths.add(path);
         }
       }
-      _newImageFiles
-        ..clear()
-        ..addAll(restoredImages);
-    }
+      if (restoredLocalPaths.isNotEmpty) {
+        _newImageFiles
+          ..clear()
+          ..addAll(restoredLocalPaths.map(XFile.new));
+        if (_existingImageUrls.isNotEmpty) {
+          final localPath = restoredLocalPaths.first;
+          _localMediaPaths[_existingImageUrls.first] = localPath;
+          if (_existingThumbnailUrls.isNotEmpty) {
+            _localMediaPaths[_existingThumbnailUrls.first] = localPath;
+          }
+        }
+      }
 
-    final localVideoPath = (draft['localVideoPath'] as String?)?.trim();
-    if (localVideoPath != null && localVideoPath.isNotEmpty) {
-      if (kIsWeb || await File(localVideoPath).exists()) {
-        _videoFile = XFile(
-          localVideoPath,
-          name: (draft['pendingVideoName'] as String?)?.trim() ?? '',
-        );
+      final localVideoPath = (draft['localVideoPath'] as String?)?.trim();
+      if (localVideoPath != null && localVideoPath.isNotEmpty) {
+        if (kIsWeb || await File(localVideoPath).exists()) {
+          _videoFile = XFile(
+            localVideoPath,
+            name: (draft['pendingVideoName'] as String?)?.trim() ?? '',
+          );
+        }
       }
     }
 
@@ -838,8 +1014,8 @@ class AddProductScreenState extends State<AddProductScreen>
     if (aiStatus == 'queued' || aiStatus == 'processing') {
       _isAnalyzingProductWithAi = true;
       _aiQueueStatusText = aiStatus == 'processing'
-          ? 'ถึงคิวแล้ว กำลังประมวลผล AI...'
-          : 'กำลังรอคิว AI...';
+          ? 'ถึงคิวแล้ว กำลังประมวลผล AI... ออกจากหน้านี้ได้'
+          : 'กำลังรอคิว AI... ออกจากหน้านี้ได้';
     } else if (aiStatus == 'failed') {
       _isAnalyzingProductWithAi = false;
       _hasUsedAiProductAnalysisForProduct = false;
@@ -851,7 +1027,8 @@ class AddProductScreenState extends State<AddProductScreen>
 
     final aiResult = draft['aiResult'];
     if (aiResult is Map &&
-        (aiStatus == 'completed' || _hasUsedAiProductAnalysisForProduct)) {
+        (aiStatus == 'completed' || _hasUsedAiProductAnalysisForProduct) &&
+        _currentImageCount > 0) {
       _applyAiProductAnalysis(_aiResultFromDynamicMap(aiResult));
       _hasUsedAiProductAnalysisForProduct = true;
       _isAnalyzingProductWithAi = false;
@@ -956,9 +1133,10 @@ class AddProductScreenState extends State<AddProductScreen>
   }
 
   Future<void> _persistDraftNow() async {
-    if (!_draftPersistenceEnabled ||
-        !_draftRestoreComplete ||
-        _draftSessionClosed) {
+    if (!_draftPersistenceEnabled || _draftSessionClosed) {
+      return;
+    }
+    if (!_draftRestoreComplete && !_localMediaDirty) {
       return;
     }
     final ownerUid = _effectiveOwnerUid;
@@ -1110,18 +1288,20 @@ class AddProductScreenState extends State<AddProductScreen>
     }
 
     if (aiStatus == 'queued' || aiStatus == 'processing') {
-      if (!_isAnalyzingProductWithAi && mounted) {
+      if (mounted) {
         setState(() {
           _isAnalyzingProductWithAi = true;
           _aiQueueStatusText = aiStatus == 'processing'
-              ? 'ถึงคิวแล้ว กำลังประมวลผล AI...'
-              : 'กำลังรอคิว AI...';
+              ? 'ถึงคิวแล้ว กำลังประมวลผล AI... ออกจากหน้านี้ได้'
+              : 'กำลังรอคิว AI... ออกจากหน้านี้ได้';
         });
       }
       return;
     }
 
     if (aiStatus == 'failed') {
+      _aiDraftPollTimer?.cancel();
+      _aiDraftPollTimer = null;
       if (mounted) {
         setState(() {
           _isAnalyzingProductWithAi = false;
@@ -1140,6 +1320,8 @@ class AddProductScreenState extends State<AddProductScreen>
       if (!_hasUsedAiProductAnalysisForProduct) {
         _applyAiProductAnalysis(_aiResultFromDynamicMap(aiResult));
       }
+      _aiDraftPollTimer?.cancel();
+      _aiDraftPollTimer = null;
       if (mounted) {
         setState(() {
           _hasUsedAiProductAnalysisForProduct = true;
@@ -1153,7 +1335,9 @@ class AddProductScreenState extends State<AddProductScreen>
 
   _AiProductAnalysisResult _aiResultFromDynamicMap(Map<dynamic, dynamic> data) {
     return _AiProductAnalysisResult(
-      productName: (data['productName'] ?? '').toString().trim(),
+      productName: (data['productName'] ?? data['name'] ?? '')
+          .toString()
+          .trim(),
       description: (data['description'] ?? '').toString().trim(),
       taxStatus: (data['taxStatus'] ?? '').toString().trim(),
       taxReason: (data['taxReason'] ?? '').toString().trim(),
@@ -1201,6 +1385,30 @@ class AddProductScreenState extends State<AddProductScreen>
     );
   }
 
+  void _adoptUploadedImage({
+    required String originalUrl,
+    required String thumbnailUrl,
+    String? localPath,
+  }) {
+    _existingImageUrls
+      ..clear()
+      ..add(originalUrl);
+    _existingThumbnailUrls
+      ..clear()
+      ..add(thumbnailUrl);
+    if (localPath != null &&
+        localPath.isNotEmpty &&
+        _localImageFileReady(localPath)) {
+      _localMediaPaths[originalUrl] = localPath;
+      _localMediaPaths[thumbnailUrl] = localPath;
+      _newImageFiles
+        ..clear()
+        ..add(XFile(localPath));
+      return;
+    }
+    _newImageFiles.clear();
+  }
+
   Future<({String imageUrl, String? thumbnailUrl})?>
   _resolveDraftImageUrls() async {
     if (_existingImageUrls.isNotEmpty) {
@@ -1215,26 +1423,42 @@ class AddProductScreenState extends State<AddProductScreen>
       return null;
     }
 
-    final uploaded = await _uploadImageToFirebase(_newImageFiles.first);
-    if (uploaded == null) {
+    final _ProductImageUploadResult? uploaded;
+    try {
+      uploaded = await _uploadImageToFirebase(_newImageFiles.first)
+          .timeout(const Duration(seconds: 45));
+    } on TimeoutException {
+      throw Exception(
+        'อัปโหลดรูปใช้เวลานานเกินไป — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่',
+      );
+    }
+    final result = uploaded;
+    if (result == null) {
       throw Exception('อัปโหลดรูปไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่');
     }
 
+    final localPath = _newImageFiles.isNotEmpty
+        ? _newImageFiles.first.path
+        : result.originalLocalPath;
     if (mounted) {
       setState(() {
-        _existingImageUrls.add(uploaded.originalUrl);
-        _existingThumbnailUrls.add(uploaded.thumbnailUrl);
-        _newImageFiles.removeAt(0);
+        _adoptUploadedImage(
+          originalUrl: result.originalUrl,
+          thumbnailUrl: result.thumbnailUrl,
+          localPath: localPath,
+        );
       });
     } else {
-      _existingImageUrls.add(uploaded.originalUrl);
-      _existingThumbnailUrls.add(uploaded.thumbnailUrl);
-      _newImageFiles.removeAt(0);
+      _adoptUploadedImage(
+        originalUrl: result.originalUrl,
+        thumbnailUrl: result.thumbnailUrl,
+        localPath: localPath,
+      );
     }
-    await _persistDraftNow();
+    unawaited(_persistDraftNow());
     return (
-      imageUrl: uploaded.originalUrl,
-      thumbnailUrl: uploaded.thumbnailUrl,
+      imageUrl: result.originalUrl,
+      thumbnailUrl: result.thumbnailUrl,
     );
   }
 
@@ -1245,6 +1469,15 @@ class AddProductScreenState extends State<AddProductScreen>
       throw Exception('ไม่พบ draft session สำหรับ AI');
     }
 
+    if (mounted) {
+      setState(() {
+        _isAnalyzingProductWithAi = true;
+        _aiQueueStatusText = _existingImageUrls.isEmpty
+            ? 'กำลังอัปโหลดรูปสำหรับ AI...'
+            : 'กำลังส่งเข้าคิว AI...';
+      });
+    }
+
     final imageUrls = await _resolveDraftImageUrls();
     if (imageUrls == null) {
       throw Exception('กรุณาเพิ่มรูปสินค้าก่อนให้ AI วิเคราะห์');
@@ -1253,34 +1486,70 @@ class AddProductScreenState extends State<AddProductScreen>
     final requestId = _createAiRequestId();
     _acceptedAiRequestId = requestId;
     _aiAnalysisDiscarded = false;
-    final callable = _aiCallable('enqueueProductAiAnalysis');
-    await callable.call(<String, dynamic>{
-      'requestId': requestId,
-      'draftId': draftId,
-      'imageUrl': imageUrls.imageUrl,
-      'thumbnailUrl': imageUrls.thumbnailUrl,
-      'productName': _nameController.text.trim(),
-      'description': _productDescriptionController.text.trim(),
-      'category': (_selectedProductCategory ?? '').trim(),
-      'price': _priceController.text.trim(),
-      'unit': _selectedUnit == 'อื่นๆ'
-          ? _otherUnitController.text.trim()
-          : (_selectedUnit ?? '').trim(),
-      'weight': _weightController.text.trim(),
-      'weightUnit': _weightUnit,
+    _startDraftWatch();
+    _listenAiQueueStatus(requestId);
+    _startAiDraftPoll();
+    if (mounted) {
+      setState(() => _aiQueueStatusText = 'กำลังส่งเข้าคิว AI...');
+    }
+    final callable = _enqueueAiCallable();
+    Timer? enqueueProgressTimer;
+    enqueueProgressTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted ||
+          _aiAnalysisDiscarded ||
+          _acceptedAiRequestId != requestId ||
+          _hasUsedAiProductAnalysisForProduct) {
+        return;
+      }
+      setState(
+        () => _aiQueueStatusText =
+            'ถึงคิวแล้ว กำลังประมวลผล AI... ออกจากหน้านี้ได้',
+      );
     });
+    try {
+      final response = await callable.call(<String, dynamic>{
+        'requestId': requestId,
+        'draftId': draftId,
+        'imageUrl': imageUrls.imageUrl,
+        'thumbnailUrl': imageUrls.thumbnailUrl,
+        'productName': _nameController.text.trim(),
+        'description': _productDescriptionController.text.trim(),
+        'category': (_selectedProductCategory ?? '').trim(),
+        'price': _priceController.text.trim(),
+        'unit': _selectedUnit == 'อื่นๆ'
+            ? _otherUnitController.text.trim()
+            : (_selectedUnit ?? '').trim(),
+        'weight': _weightController.text.trim(),
+        'weightUnit': _weightUnit,
+      });
+      enqueueProgressTimer.cancel();
+      if (_aiAnalysisDiscarded || _acceptedAiRequestId != requestId) {
+        return;
+      }
+      if (response.data is Map) {
+        _handleEnqueueAiResponse(
+          Map<dynamic, dynamic>.from(response.data as Map),
+          requestId,
+        );
+        return;
+      }
+    } on TimeoutException {
+      enqueueProgressTimer.cancel();
+      debugPrint('enqueueProductAiAnalysis timed out; keep polling job');
+      if (mounted) {
+        setState(
+          () => _aiQueueStatusText =
+              'กำลังประมวลผล AI... ออกจากหน้านี้ได้',
+        );
+      }
+    } finally {
+      enqueueProgressTimer.cancel();
+    }
 
     if (_aiAnalysisDiscarded || _acceptedAiRequestId != requestId) {
       return;
     }
-
-    if (mounted) {
-      setState(() {
-        _isAnalyzingProductWithAi = true;
-        _aiQueueStatusText = 'กำลังเข้าคิว AI...';
-      });
-    }
-    await _persistDraftNow();
+    unawaited(_persistDraftNow());
 
     if (!automatic && mounted) {
       _showSnack('ส่งคำขอ AI แล้ว — ออกจากหน้านี้ได้ ระบบจะแจ้งเมื่อเสร็จ');
@@ -1496,6 +1765,9 @@ class AddProductScreenState extends State<AddProductScreen>
       WidgetsBinding.instance.removeObserver(this);
     }
     _draftSaveDebounce?.cancel();
+    _aiDraftPollTimer?.cancel();
+    _aiJobProbeTimer?.cancel();
+    _aiQueueSubscription?.cancel();
     _draftWatchSubscription?.cancel();
     // Dispose controllers
     _nameController.dispose();
@@ -1831,7 +2103,9 @@ class AddProductScreenState extends State<AddProductScreen>
         serviceType: hintedServiceType,
       );
       if (_shopProfileReadyForSave(hinted)) {
-        unawaited(ShopProfileCacheService.instance.saveProfile(userId, hinted!));
+        unawaited(
+          ShopProfileCacheService.instance.saveProfile(userId, hinted!),
+        );
         return hinted;
       }
     }
@@ -2114,6 +2388,10 @@ class AddProductScreenState extends State<AddProductScreen>
 
     _aiQueueSubscription?.cancel();
     _aiQueueSubscription = null;
+    _aiJobProbeTimer?.cancel();
+    _aiJobProbeTimer = null;
+    _aiDraftPollTimer?.cancel();
+    _aiDraftPollTimer = null;
   }
 
   Future<void> _resetAiProductAnalysisForImageChange() async {
@@ -2124,7 +2402,7 @@ class AddProductScreenState extends State<AddProductScreen>
     if (!_draftPersistenceEnabled) {
       return;
     }
-    await _persistDraftPatch(<String, dynamic>{
+    unawaited(_persistDraftPatch(<String, dynamic>{
       'hasUsedAiProductAnalysisForProduct': false,
       'hasUsedAiDescriptionForProduct': false,
       'hasAiTaxAnalysis': false,
@@ -2162,7 +2440,7 @@ class AddProductScreenState extends State<AddProductScreen>
       'unit': _selectedUnit == 'อื่นๆ'
           ? _otherUnitController.text.trim()
           : (_selectedUnit ?? '').trim(),
-    });
+    }));
   }
 
   Future<void> _applySelectedProductImages(
@@ -2174,11 +2452,9 @@ class AddProductScreenState extends State<AddProductScreen>
     }
 
     final imagesToKeep = images.take(_maxImageCount).toList();
-    if (replaceExisting) {
-      await _resetAiProductAnalysisForImageChange();
-      if (!mounted) {
-        return;
-      }
+    final shouldResetAi = replaceExisting || _currentImageCount == 0;
+
+    if (replaceExisting || shouldResetAi) {
       setState(() {
         _existingImageUrls.clear();
         _existingThumbnailUrls.clear();
@@ -2189,13 +2465,25 @@ class AddProductScreenState extends State<AddProductScreen>
     } else {
       setState(() => _newImageFiles.addAll(imagesToKeep));
     }
+    _localMediaDirty = true;
+
+    if (shouldResetAi) {
+      unawaited(_resetAiProductAnalysisForImageChange());
+    }
 
     unawaited(_persistDraftNow());
     unawaited(_analyzeProductWithAi(automatic: true));
   }
 
+  bool _isImagePickerCancelled(PlatformException error) {
+    return error.code == 'multiple_request' ||
+        error.code == 'already_active' ||
+        error.code == 'canceled' ||
+        error.code == 'cancelled';
+  }
+
   Future<void> _pickImagesFromGallery() async {
-    if (_isResolvingServiceType) return;
+    if (_isResolvingServiceType || _imagePickerBusy) return;
 
     final blocked = _imagePickBlockedReason;
     if (blocked != null) {
@@ -2215,6 +2503,7 @@ class AddProductScreenState extends State<AddProductScreen>
         replaceExisting ||
         (_usesFirstImageAiGate && _currentImageCount == 0);
 
+    _imagePickerBusy = true;
     try {
       final List<XFile> picks;
       if (kIsWeb) {
@@ -2247,12 +2536,11 @@ class AddProductScreenState extends State<AddProductScreen>
       final picksToProcess = replaceExisting
           ? picks.take(_maxImageCount).toList()
           : picks.take(remainingSlots).toList();
-      final compressedToAdd = await _compressPickedImages(picksToProcess);
-      if (compressedToAdd.isEmpty) return;
       await _applySelectedProductImages(
-        compressedToAdd,
+        picksToProcess,
         replaceExisting: replaceExisting,
       );
+      unawaited(_replacePickedImagesWithCompressed(picksToProcess));
 
       if (!replaceExisting && picks.length > remainingSlots) {
         _showSnack(
@@ -2260,6 +2548,7 @@ class AddProductScreenState extends State<AddProductScreen>
         );
       }
     } on PlatformException catch (error) {
+      if (_isImagePickerCancelled(error)) return;
       _showSnack(
         error.message?.trim().isNotEmpty == true
             ? error.message!.trim()
@@ -2267,11 +2556,13 @@ class AddProductScreenState extends State<AddProductScreen>
       );
     } catch (error) {
       _showSnack('เลือกรูปไม่สำเร็จ: $error');
+    } finally {
+      _imagePickerBusy = false;
     }
   }
 
   Future<void> _captureImage() async {
-    if (_isResolvingServiceType) return;
+    if (_isResolvingServiceType || _imagePickerBusy) return;
 
     final replaceExisting = _canReplaceProductImageAtCapacity;
     final blocked = _imagePickBlockedReason;
@@ -2280,6 +2571,7 @@ class AddProductScreenState extends State<AddProductScreen>
       return;
     }
 
+    _imagePickerBusy = true;
     try {
       if (!kIsWeb) {
         final cameraStatus = await Permission.camera.request();
@@ -2296,13 +2588,13 @@ class AddProductScreenState extends State<AddProductScreen>
         imageQuality: _pickerImageQuality,
       );
       if (photo == null) return;
-      final compressed = await _compressPickedImages(<XFile>[photo]);
-      if (compressed.isEmpty) return;
       await _applySelectedProductImages(
-        compressed,
+        <XFile>[photo],
         replaceExisting: replaceExisting,
       );
+      unawaited(_replacePickedImagesWithCompressed(<XFile>[photo]));
     } on PlatformException catch (error) {
+      if (_isImagePickerCancelled(error)) return;
       _showSnack(
         error.message?.trim().isNotEmpty == true
             ? error.message!.trim()
@@ -2310,7 +2602,32 @@ class AddProductScreenState extends State<AddProductScreen>
       );
     } catch (error) {
       _showSnack('ถ่ายรูปไม่สำเร็จ: $error');
+    } finally {
+      _imagePickerBusy = false;
     }
+  }
+
+  Future<void> _replacePickedImagesWithCompressed(List<XFile> picks) async {
+    if (picks.isEmpty || !mounted) {
+      return;
+    }
+    final compressed = await _compressPickedImages(picks);
+    if (compressed.isEmpty || !mounted) {
+      return;
+    }
+    setState(() {
+      for (var index = 0; index < compressed.length; index++) {
+        final compressedFile = compressed[index];
+        final pickPath = picks[index].path;
+        final existingIndex = _newImageFiles.indexWhere(
+          (file) => file.path == pickPath,
+        );
+        if (existingIndex >= 0) {
+          _newImageFiles[existingIndex] = compressedFile;
+        }
+      }
+    });
+    unawaited(_persistDraftNow());
   }
 
   Future<List<XFile>> _compressPickedImages(List<XFile> picks) async {
@@ -2816,7 +3133,9 @@ class AddProductScreenState extends State<AddProductScreen>
     final status = (data['status'] ?? '').toString();
     final position = data['position'] is num
         ? (data['position'] as num).toInt()
-        : null;
+        : (data['queuePosition'] is num
+              ? (data['queuePosition'] as num).toInt()
+              : null);
     final estimatedSeconds = data['estimatedWaitSeconds'] is num
         ? (data['estimatedWaitSeconds'] as num).toInt()
         : null;
@@ -2829,10 +3148,10 @@ class AddProductScreenState extends State<AddProductScreen>
       final waitText = estimatedSeconds != null
           ? ' ${_formatAiWait(estimatedSeconds)}'
           : '';
-      return '$positionText$waitText';
+      return '$positionText$waitText — ออกจากหน้านี้ได้';
     }
     if (status == 'processing') {
-      return 'ถึงคิวแล้ว กำลังประมวลผล AI...';
+      return 'ถึงคิวแล้ว กำลังประมวลผล AI... ออกจากหน้านี้ได้';
     }
     if (status == 'rejected') {
       return message.isNotEmpty
@@ -2845,45 +3164,251 @@ class AddProductScreenState extends State<AddProductScreen>
     if (status == 'completed') {
       return 'ประมวลผล AI สำเร็จ';
     }
-    return 'กำลังส่งคำขอ AI...';
+    return 'กำลังเข้าคิว AI...';
   }
 
   void _listenAiQueueStatus(String requestId) {
     _aiQueueSubscription?.cancel();
-    if (mounted) {
-      setState(() {
-        _aiQueueStatusText = 'กำลังส่งคำขอ AI...';
-        _aiQueueExternalRecommendation = false;
-      });
-    }
+    _aiJobProbeTimer?.cancel();
+    _aiJobProbeTimer = null;
 
     _aiQueueSubscription = FirebaseFirestore.instance
-        .collection('ai_processing_queue')
+        .collection('product_ai_jobs')
         .doc(requestId)
         .snapshots()
         .listen(
           (snapshot) {
-            if (!mounted || !snapshot.exists) return;
-            final data = snapshot.data() ?? <String, dynamic>{};
-            setState(() {
-              _aiQueueStatusText = _buildAiQueueText(data);
-              _aiQueueExternalRecommendation =
-                  data['externalAiRecommended'] == true;
-            });
+            if (!mounted) return;
+            if (!snapshot.exists) return;
+            _handleAiJobSnapshot(snapshot.data() ?? <String, dynamic>{});
           },
           onError: (_) {
             if (!mounted) return;
-            setState(() {
-              _aiQueueStatusText = 'กำลังเข้าคิว AI...';
-              _aiQueueExternalRecommendation = false;
+            Future<void>.delayed(const Duration(seconds: 2), () {
+              if (!mounted ||
+                  _aiAnalysisDiscarded ||
+                  _acceptedAiRequestId != requestId) {
+                return;
+              }
+              _listenAiQueueStatus(requestId);
             });
           },
         );
+
+    _startAiJobProbe(requestId);
+  }
+
+  void _startAiJobProbe(String requestId) {
+    _aiJobProbeTimer?.cancel();
+    var attempts = 0;
+    _aiJobProbeTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      if (!mounted ||
+          _aiAnalysisDiscarded ||
+          _acceptedAiRequestId != requestId ||
+          !_isAnalyzingProductWithAi ||
+          _hasUsedAiProductAnalysisForProduct) {
+        timer.cancel();
+        _aiJobProbeTimer = null;
+        return;
+      }
+      attempts += 1;
+      if (attempts > 8) {
+        timer.cancel();
+        _aiJobProbeTimer = null;
+        return;
+      }
+      unawaited(_probeAiJobDoc(requestId));
+    });
+  }
+
+  Future<void> _probeAiJobDoc(String requestId) async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('product_ai_jobs')
+          .doc(requestId)
+          .get(const GetOptions(source: Source.serverAndCache));
+      if (!mounted || !snapshot.exists) return;
+      _handleAiJobSnapshot(snapshot.data() ?? <String, dynamic>{});
+    } catch (_) {
+      // เงียบ — listener / draft watch จะอัปเดตเมื่อพร้อม
+    }
+  }
+
+  void _handleAiJobSnapshot(Map<String, dynamic> data) {
+    if (_aiAnalysisDiscarded) return;
+    final status = (data['status'] ?? '').toString();
+    setState(() {
+      _aiQueueStatusText = _buildAiQueueText(data);
+      _aiQueueExternalRecommendation = data['externalAiRecommended'] == true;
+    });
+    if (status == 'completed') {
+      _aiJobProbeTimer?.cancel();
+      _aiJobProbeTimer = null;
+      _applyAiFromJobDoc(data);
+      return;
+    }
+    if (status == 'failed') {
+      _aiJobProbeTimer?.cancel();
+      _aiJobProbeTimer = null;
+      _aiDraftPollTimer?.cancel();
+      _aiDraftPollTimer = null;
+      if (mounted) {
+        setState(() {
+          _isAnalyzingProductWithAi = false;
+          _hasUsedAiProductAnalysisForProduct = false;
+        });
+      }
+      return;
+    }
+    if (status == 'processing' || status == 'queued') {
+      unawaited(_refreshAiFromDraftCacheOnly());
+    }
+  }
+
+  void _handleEnqueueAiResponse(
+    Map<dynamic, dynamic> payload,
+    String requestId,
+  ) {
+    if (_aiAnalysisDiscarded || _acceptedAiRequestId != requestId) {
+      return;
+    }
+    final status = (payload['status'] ?? '').toString();
+    final aiResult = payload['aiResult'];
+    final error = (payload['error'] ?? '').toString().trim();
+    if (status == 'completed' && aiResult is Map) {
+      _applyAiFromJobDoc(<String, dynamic>{
+        'status': 'completed',
+        'aiResult': Map<String, dynamic>.from(aiResult),
+      });
+      return;
+    }
+    if (status == 'failed') {
+      _aiJobProbeTimer?.cancel();
+      _aiJobProbeTimer = null;
+      if (mounted) {
+        setState(() {
+          _isAnalyzingProductWithAi = false;
+          _hasUsedAiProductAnalysisForProduct = false;
+          _aiQueueStatusText = error.isNotEmpty
+              ? error
+              : 'AI ประมวลผลไม่สำเร็จ';
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      setState(() {
+        _isAnalyzingProductWithAi = true;
+        _aiQueueStatusText = status == 'queued'
+            ? 'กำลังรอคิว AI... ออกจากหน้านี้ได้'
+            : 'ถึงคิวแล้ว กำลังประมวลผล AI... ออกจากหน้านี้ได้';
+      });
+    }
+  }
+
+  void _applyAiFromJobDoc(Map<String, dynamic> data) {
+    final aiResult = data['aiResult'];
+    if (aiResult is Map && !_hasUsedAiProductAnalysisForProduct) {
+      _applyAiProductAnalysis(
+        _aiResultFromDynamicMap(Map<dynamic, dynamic>.from(aiResult)),
+      );
+    } else {
+      unawaited(_refreshAiFromDraftCacheOnly());
+    }
+    _aiJobProbeTimer?.cancel();
+    _aiJobProbeTimer = null;
+    _aiDraftPollTimer?.cancel();
+    _aiDraftPollTimer = null;
+    if (mounted) {
+      setState(() {
+        _hasUsedAiProductAnalysisForProduct = true;
+        _isAnalyzingProductWithAi = false;
+        _aiQueueStatusText = 'ประมวลผล AI สำเร็จ';
+      });
+    }
+    unawaited(_persistDraftLocallyOnly());
+    unawaited(_persistDraftNow());
+  }
+
+  Future<void> _persistDraftLocallyOnly() async {
+    if (!_draftPersistenceEnabled || _draftSessionClosed) {
+      return;
+    }
+    final ownerUid = _effectiveOwnerUid;
+    final draftId = _activeDraftId;
+    if (ownerUid == null || ownerUid.isEmpty || draftId == null) {
+      return;
+    }
+    try {
+      await ProductAddDraftStore.instance.save(ownerUid, {
+        ..._buildDraftPayload(),
+        'draftId': draftId,
+        'hasUsedAiProductAnalysisForProduct': _hasUsedAiProductAnalysisForProduct,
+      });
+    } catch (_) {
+      // เงียบ — remote sync จะทำทีหลังเมื่อเน็ตพร้อม
+    }
+  }
+
+  void _startAiDraftPoll() {
+    _startDraftWatch();
+    if (_draftWatchSubscription != null) {
+      _aiDraftPollTimer?.cancel();
+      _aiDraftPollTimer = null;
+      return;
+    }
+    _aiDraftPollTimer?.cancel();
+    _aiDraftPollTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+      if (!mounted ||
+          !_isAnalyzingProductWithAi ||
+          _aiAnalysisDiscarded ||
+          _hasUsedAiProductAnalysisForProduct) {
+        _aiDraftPollTimer?.cancel();
+        _aiDraftPollTimer = null;
+        return;
+      }
+      unawaited(_refreshAiFromDraft());
+    });
+  }
+
+  Future<void> _refreshAiFromDraftCacheOnly() async {
+    if (_aiDraftPollInFlight) {
+      return;
+    }
+    final ownerUid = _effectiveOwnerUid;
+    final draftId = _activeDraftId;
+    if (ownerUid == null || draftId == null) {
+      return;
+    }
+    _aiDraftPollInFlight = true;
+    try {
+      final data = await ProductDraftService.instance.loadDraft(
+        ownerUid: ownerUid,
+        draftId: draftId,
+        source: Source.cache,
+      );
+      if (data == null || !mounted) {
+        return;
+      }
+      await _handleDraftSnapshot(data);
+    } catch (_) {
+      // เงียบ — draft watch / job listener เป็นหลัก
+    } finally {
+      _aiDraftPollInFlight = false;
+    }
+  }
+
+  Future<void> _refreshAiFromDraft() async {
+    await _refreshAiFromDraftCacheOnly();
   }
 
   void _clearAiQueueStatus() {
     _aiQueueSubscription?.cancel();
     _aiQueueSubscription = null;
+    _aiJobProbeTimer?.cancel();
+    _aiJobProbeTimer = null;
+    _aiDraftPollTimer?.cancel();
+    _aiDraftPollTimer = null;
     if (!mounted) return;
     setState(() {
       _aiQueueStatusText = null;
@@ -2910,6 +3435,9 @@ class AddProductScreenState extends State<AddProductScreen>
     }
     if (e.code == 'deadline-exceeded') {
       return 'AI ใช้เวลานานเกินไป (คิวเต็มหรือเครือข่ายช้า) กรุณารอสักครู่แล้วลองใหม่';
+    }
+    if (e.code == 'unavailable' || e.code == 'internal') {
+      return 'ระบบ AI ตอบช้าชั่วคราว คำขออาจอยู่ในคิวแล้ว กรุณารอสักครู่หรือลองใหม่';
     }
     return e.message ?? 'AI วิเคราะห์สินค้าไม่สำเร็จ (${e.code})';
   }
@@ -3063,6 +3591,15 @@ class AddProductScreenState extends State<AddProductScreen>
     );
   }
 
+  HttpsCallable _enqueueAiCallable() {
+    return FirebaseFunctions.instanceFor(
+      region: 'asia-southeast1',
+    ).httpsCallable(
+      'enqueueProductAiAnalysis',
+      options: HttpsCallableOptions(timeout: _enqueueAiCallableTimeout),
+    );
+  }
+
   Future<_AiProductAnalysisResult> _requestProductAnalysis({
     required Uint8List imageBytes,
     required String mimeType,
@@ -3183,12 +3720,30 @@ class AddProductScreenState extends State<AddProductScreen>
     return null;
   }
 
-  void _applyAiProductAnalysis(_AiProductAnalysisResult result) {
-    if (!_isEditingExistingProduct &&
+  void _applyAiProductAnalysis(
+    _AiProductAnalysisResult result, {
+    bool force = false,
+  }) {
+    if (!force &&
+        !_isEditingExistingProduct &&
         (_aiAnalysisDiscarded || _currentImageCount == 0)) {
       return;
     }
+    _writeAiAnalysisToForm(result, force: force);
+    if (mounted) {
+      setState(() {});
+    }
+    _scheduleDraftSave();
+    final cacheImagePath = _newImageFiles.isNotEmpty
+        ? _newImageFiles.first.path
+        : null;
+    unawaited(_saveAiResultToImageCache(result, imagePath: cacheImagePath));
+  }
 
+  void _writeAiAnalysisToForm(
+    _AiProductAnalysisResult result, {
+    required bool force,
+  }) {
     final productName = result.productName?.trim();
     final description = result.description?.trim();
     final category = result.productCategory?.trim();
@@ -3198,107 +3753,99 @@ class AddProductScreenState extends State<AddProductScreen>
     final legalReason = result.legalReason?.trim();
     final nationwideReason = result.nationwideShippingReason?.trim();
 
-    setState(() {
-      if (productName != null &&
-          productName.isNotEmpty &&
-          _nameController.text.trim().isEmpty) {
-        _nameController.text = productName;
-      }
+    if (productName != null &&
+        productName.isNotEmpty &&
+        (force || _nameController.text.trim().isEmpty)) {
+      _nameController.text = productName;
+    }
 
-      if (description != null && description.isNotEmpty) {
-        _productDescriptionController.text = description;
-        _hasUsedAiDescriptionForProduct = true;
-      }
+    if (description != null && description.isNotEmpty) {
+      _productDescriptionController.text = description;
+      _hasUsedAiDescriptionForProduct = true;
+    }
 
-      if (category != null &&
-          category.isNotEmpty &&
-          _productCategories.contains(category)) {
-        _selectedProductCategory = category;
-      } else if ((_selectedProductCategory ?? '').isEmpty) {
-        _selectedProductCategory = taxStatus == 'exempt'
-            ? 'ของสด'
-            : 'สินค้าทั่วไป';
-      }
+    if (category != null &&
+        category.isNotEmpty &&
+        _productCategories.contains(category)) {
+      _selectedProductCategory = category;
+    } else if ((_selectedProductCategory ?? '').isEmpty) {
+      _selectedProductCategory = taxStatus == 'exempt'
+          ? 'ของสด'
+          : 'สินค้าทั่วไป';
+    }
 
-      if (_isPharmacyCategory) {
-        _isFreshProduct = false;
-        _isProcessed = false;
-        if (taxStatus == 'taxable' || taxStatus == 'exempt') {
-          _pharmacyIsTaxable = taxStatus == 'taxable';
-        }
-      } else if (result.isFreshProduct != null || result.isProcessed != null) {
-        _isFreshProduct = result.isFreshProduct ?? _isFreshProduct;
-        _isProcessed = result.isProcessed ?? _isProcessed;
-      } else if (taxStatus == 'exempt') {
-        _isFreshProduct = true;
-        _isProcessed = false;
-      } else if (taxStatus == 'taxable') {
-        _isFreshProduct = false;
-        _isProcessed = true;
+    if (_isPharmacyCategory) {
+      _isFreshProduct = false;
+      _isProcessed = false;
+      if (taxStatus == 'taxable' || taxStatus == 'exempt') {
+        _pharmacyIsTaxable = taxStatus == 'taxable';
       }
+    } else if (result.isFreshProduct != null || result.isProcessed != null) {
+      _isFreshProduct = result.isFreshProduct ?? _isFreshProduct;
+      _isProcessed = result.isProcessed ?? _isProcessed;
+    } else if (taxStatus == 'exempt') {
+      _isFreshProduct = true;
+      _isProcessed = false;
+    } else if (taxStatus == 'taxable') {
+      _isFreshProduct = false;
+      _isProcessed = true;
+    }
 
-      if (taxReason != null && taxReason.isNotEmpty) {
-        _aiTaxAnalysisReason = taxReason;
-      }
+    if (taxReason != null && taxReason.isNotEmpty) {
+      _aiTaxAnalysisReason = taxReason;
+    }
 
-      if (productType != null && productType.isNotEmpty) {
-        _aiProductType = productType;
-      }
+    if (productType != null && productType.isNotEmpty) {
+      _aiProductType = productType;
+    }
 
-      if (result.isLegalInThailand != null) {
-        _aiIsLegalInThailand = result.isLegalInThailand;
-      }
-      if (legalReason != null && legalReason.isNotEmpty) {
-        _aiLegalAnalysisReason = legalReason;
-      }
+    if (result.isLegalInThailand != null) {
+      _aiIsLegalInThailand = result.isLegalInThailand;
+    }
+    if (legalReason != null && legalReason.isNotEmpty) {
+      _aiLegalAnalysisReason = legalReason;
+    }
 
-      if (taxStatus == 'taxable' ||
-          taxStatus == 'exempt' ||
-          (taxReason != null && taxReason.isNotEmpty)) {
-        _hasAiTaxAnalysis = true;
-      }
+    if (taxStatus == 'taxable' ||
+        taxStatus == 'exempt' ||
+        (taxReason != null && taxReason.isNotEmpty)) {
+      _hasAiTaxAnalysis = true;
+    }
 
-      if (result.canShipNationwide != null) {
-        _aiCanShipNationwide = result.canShipNationwide;
-      }
-      if (nationwideReason != null && nationwideReason.isNotEmpty) {
-        _aiNationwideShippingReason = nationwideReason;
-      }
+    if (result.canShipNationwide != null) {
+      _aiCanShipNationwide = result.canShipNationwide;
+    }
+    if (nationwideReason != null && nationwideReason.isNotEmpty) {
+      _aiNationwideShippingReason = nationwideReason;
+    }
 
-      _applyParcelDimensionField(
-        controller: _parcelLengthController,
-        value: result.parcelLengthCm,
-      );
-      _applyParcelDimensionField(
-        controller: _parcelWidthController,
-        value: result.parcelWidthCm,
-      );
-      _applyParcelDimensionField(
-        controller: _parcelHeightController,
-        value: result.parcelHeightCm,
-      );
-      final parcelReason = result.parcelDimensionReason?.trim();
-      if (parcelReason != null && parcelReason.isNotEmpty) {
-        _aiParcelDimensionReason = parcelReason;
-      }
+    _applyParcelDimensionField(
+      controller: _parcelLengthController,
+      value: result.parcelLengthCm,
+    );
+    _applyParcelDimensionField(
+      controller: _parcelWidthController,
+      value: result.parcelWidthCm,
+    );
+    _applyParcelDimensionField(
+      controller: _parcelHeightController,
+      value: result.parcelHeightCm,
+    );
+    final parcelReason = result.parcelDimensionReason?.trim();
+    if (parcelReason != null && parcelReason.isNotEmpty) {
+      _aiParcelDimensionReason = parcelReason;
+    }
 
-      _applyAiSaleUnit(result.saleUnit);
+    _applyAiSaleUnit(result.saleUnit);
 
-      _aiProductNameConfidence = result.productNameConfidence;
-      _aiTaxConfidence = result.taxConfidence;
-      _aiProductTypeConfidence = result.productTypeConfidence;
-      _aiNationwideShippingConfidence = result.nationwideShippingConfidence;
-      _aiLegalConfidence = result.legalConfidence;
-      _aiRequiresAdminReview = result.requiresAdminReview;
-      _aiReviewReasonLabels = List<String>.from(
-        result.reviewReasonLabels ?? const <String>[],
-      );
-    });
-    _scheduleDraftSave();
-    final cacheImagePath =
-        _newImageFiles.isNotEmpty ? _newImageFiles.first.path : null;
-    unawaited(
-      _saveAiResultToImageCache(result, imagePath: cacheImagePath),
+    _aiProductNameConfidence = result.productNameConfidence;
+    _aiTaxConfidence = result.taxConfidence;
+    _aiProductTypeConfidence = result.productTypeConfidence;
+    _aiNationwideShippingConfidence = result.nationwideShippingConfidence;
+    _aiLegalConfidence = result.legalConfidence;
+    _aiRequiresAdminReview = result.requiresAdminReview;
+    _aiReviewReasonLabels = List<String>.from(
+      result.reviewReasonLabels ?? const <String>[],
     );
   }
 
@@ -3376,16 +3923,25 @@ class AddProductScreenState extends State<AddProductScreen>
       return;
     }
 
-    if (await _restoreCachedAiForCurrentImage()) {
-      return;
-    }
-
     if (_isAnalyzingProductWithAi && _draftPersistenceEnabled) {
       if (automatic) return;
       _showSnack(
         'กำลังให้ AI วิเคราะห์อยู่ — ออกจากหน้านี้ได้ ระบบจะเก็บข้อมูลไว้',
       );
       return;
+    }
+
+    try {
+      if (await _restoreCachedAiForCurrentImage()
+          .timeout(const Duration(seconds: 4))) {
+        return;
+      }
+    } on TimeoutException {
+      debugPrint('AI cache lookup timed out; continue with live analysis');
+    }
+
+    if (_isAnalyzingProductWithAi && _draftPersistenceEnabled) {
+      if (automatic) return;
     }
 
     final productName = _nameController.text.trim();
@@ -3402,7 +3958,9 @@ class AddProductScreenState extends State<AddProductScreen>
 
       setState(() {
         _isAnalyzingProductWithAi = true;
+        _aiQueueStatusText = 'กำลังเตรียมวิเคราะห์ AI...';
       });
+      _aiAnalysisDiscarded = false;
 
       try {
         await _ensureDraftReadyForAi();
@@ -4458,11 +5016,7 @@ class AddProductScreenState extends State<AddProductScreen>
 
   Future<void> _commitSaveWrite(String status, Future<void> write) async {
     try {
-      await _runSaveStep(
-        status,
-        write,
-        timeout: const Duration(seconds: 12),
-      );
+      await _runSaveStep(status, write, timeout: const Duration(seconds: 12));
     } on TimeoutException {
       debugPrint('$status timed out; keeping local cache and continuing');
     }
@@ -4535,8 +5089,9 @@ class AddProductScreenState extends State<AddProductScreen>
       final snapshot = await FirebaseFirestore.instance
           .collection('products')
           .where('ownerUid', isEqualTo: ownerUid)
+          .limit(80)
           .get()
-          .timeout(const Duration(seconds: 8));
+          .timeout(const Duration(seconds: 20));
 
       if (snapshot.docs.isEmpty) return;
 
@@ -4635,6 +5190,10 @@ class AddProductScreenState extends State<AddProductScreen>
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 12),
+              if (widget.productToEdit == null && !_isAdminDelegatedUpload) ...[
+                _buildBulkAiImportEntry(),
+                const SizedBox(height: 12),
+              ],
               _buildMediaSection(),
               if (_uploadProgress != null ||
                   _uploadStatusText != null ||
@@ -4891,7 +5450,28 @@ class AddProductScreenState extends State<AddProductScreen>
                   minimumSize: const Size(double.infinity, 50),
                 ),
                 child: _isSaving
-                    ? const CircularProgressIndicator(color: Colors.white)
+                    ? Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          _buildCircularPercentage(
+                            progress: _productSaveProgress,
+                            color: Colors.white,
+                            size: 34,
+                          ),
+                          const SizedBox(width: 12),
+                          Flexible(
+                            child: Text(
+                              _uploadStatusText ?? 'กำลังบันทึกสินค้า',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
                     : Text(
                         _hasVariants && widget.productToEdit == null
                             ? 'ถัดไป: กำหนดตัวเลือก'
@@ -4906,6 +5486,101 @@ class AddProductScreenState extends State<AddProductScreen>
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildBulkAiImportEntry() {
+    return Material(
+      color: const Color(0xFFFFF4E8),
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: () {
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => const BulkAiProductImportScreen(),
+            ),
+          );
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: AppColors.accent.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(
+                  Icons.auto_awesome_motion_outlined,
+                  color: AppColors.accent,
+                ),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'เพิ่มหลายสินค้าด้วย AI',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        fontSize: 15,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'เลือกรูปหลายรูป ระบบจะอัปโหลดและต่อคิววิเคราะห์ให้',
+                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCircularPercentage({
+    required double progress,
+    required Color color,
+    double size = 34,
+  }) {
+    final normalized = progress.clamp(0.0, 1.0).toDouble();
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: normalized),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, _) {
+        return SizedBox(
+          width: size,
+          height: size,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              CircularProgressIndicator(
+                value: value,
+                strokeWidth: 3,
+                color: color,
+                backgroundColor: color.withValues(alpha: 0.2),
+              ),
+              Text(
+                '${(value * 100).round()}%',
+                style: TextStyle(
+                  color: color,
+                  fontSize: size <= 30 ? 8 : 9,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -5031,13 +5706,37 @@ class AddProductScreenState extends State<AddProductScreen>
   }
 
   Widget _buildImagePreviewContent() {
-    final List<Widget> tiles = <Widget>[];
+    final tiles = <Widget>[];
+    final shownLocalPaths = <String>{};
+
+    for (int i = 0; i < _newImageFiles.length; i++) {
+      final file = _newImageFiles[i];
+      if (!_localImageFileReady(file.path)) continue;
+      shownLocalPaths.add(file.path);
+      tiles.add(
+        _buildImageTile(
+          image: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: _buildNewImagePreview(file),
+          ),
+          onRemove: () => _removeNewImageAt(i),
+        ),
+      );
+    }
 
     for (int i = 0; i < _existingImageUrls.length; i++) {
+      if (_maxImageCount == 1 && shownLocalPaths.isNotEmpty) {
+        break;
+      }
       final imageUrl = _existingImageUrls[i];
       final thumbnailUrl = i < _existingThumbnailUrls.length
           ? _existingThumbnailUrls[i]
           : imageUrl;
+      final mappedLocal =
+          _localMediaPaths[thumbnailUrl] ?? _localMediaPaths[imageUrl];
+      if (mappedLocal != null && shownLocalPaths.contains(mappedLocal)) {
+        continue;
+      }
       final previewCandidates = normalizeImageUrlCandidates(<String?>[
         thumbnailUrl,
         imageUrl,
@@ -5047,30 +5746,12 @@ class AddProductScreenState extends State<AddProductScreen>
           image: ClipRRect(
             borderRadius: BorderRadius.circular(12),
             child: previewCandidates.isNotEmpty
-                ? ProductNetworkImage(
-                    urls: previewCandidates,
-                    width: 110,
-                    height: 110,
-                    fit: BoxFit.cover,
-                  )
+                ? _buildCachedImage(previewCandidates.first)
                 : _buildCachedImage(''),
           ),
           onRemove: _isEditingExistingProduct
               ? null
               : () => _removeExistingImageAt(i),
-        ),
-      );
-    }
-
-    for (int i = 0; i < _newImageFiles.length; i++) {
-      final file = _newImageFiles[i];
-      tiles.add(
-        _buildImageTile(
-          image: ClipRRect(
-            borderRadius: BorderRadius.circular(12),
-            child: _buildNewImagePreview(file),
-          ),
-          onRemove: () => _removeNewImageAt(i),
         ),
       );
     }
@@ -5145,12 +5826,22 @@ class AddProductScreenState extends State<AddProductScreen>
       );
     }
     final localPath = _localMediaPaths[url];
-    if (localPath != null && !kIsWeb) {
+    if (localPath != null && _localImageFileReady(localPath)) {
       return Image.file(
         File(localPath),
         width: 110,
         height: 110,
         fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => CachedAppImage(
+          imageUrl: url,
+          width: 110,
+          height: 110,
+          fit: BoxFit.cover,
+          errorWidget: const ColoredBox(
+            color: Colors.black12,
+            child: Icon(Icons.broken_image, size: 40, color: Colors.grey),
+          ),
+        ),
       );
     }
     _tryWarmLocalCache(url);
@@ -5570,18 +6261,20 @@ class AddProductScreenState extends State<AddProductScreen>
                   ? null
                   : _analyzeProductWithAi,
               icon: _isAnalyzingProductWithAi
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                  ? _buildCircularPercentage(
+                      progress: _aiAnalysisProgress,
+                      color: AppColors.accent,
+                      size: 34,
                     )
                   : const Icon(Icons.auto_awesome_outlined),
               label: Text(
                 _isAnalyzingProductWithAi
-                    ? 'AI กำลังวิเคราะห์สินค้า...'
+                    ? (_aiQueueStatusText ?? 'AI กำลังวิเคราะห์สินค้า...')
                     : (_hasUsedAiProductAnalysisForProduct
                           ? 'ใช้ AI วิเคราะห์สินค้าแล้ว'
                           : 'วิเคราะห์สินค้า'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
               style: OutlinedButton.styleFrom(
                 foregroundColor: AppColors.accent,
@@ -5593,7 +6286,8 @@ class AddProductScreenState extends State<AddProductScreen>
               (_aiQueueStatusText ?? '').isNotEmpty) ...[
             const SizedBox(height: 8),
             Text(
-              _aiQueueStatusText!,
+              'สถานะ ${(100 * _aiAnalysisProgress).round()}% · '
+              '${_aiQueueStatusText!}',
               style: TextStyle(
                 fontSize: 12,
                 color: _aiQueueExternalRecommendation
